@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS posts (
 CREATE TABLE IF NOT EXISTS trusted (
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (chat_id, user_id)
 );
 """
@@ -85,6 +86,9 @@ class Storage:
         for name, definition in CHAT_COLUMNS:
             if name not in existing:
                 await self.db.execute(f"ALTER TABLE chats ADD COLUMN {name} {definition}")
+        async with self.db.execute("PRAGMA table_info(trusted)") as cur:
+            if "name" not in {row["name"] for row in await cur.fetchall()}:
+                await self.db.execute("ALTER TABLE trusted ADD COLUMN name TEXT NOT NULL DEFAULT ''")
         await self.db.commit()
 
     async def close(self) -> None:
@@ -133,6 +137,19 @@ class Storage:
         await self.db.execute(f"UPDATE chats SET {key} = ? WHERE chat_id = ?", (value, chat_id))
         await self.db.commit()
 
+    async def all_chats(self) -> list[aiosqlite.Row]:
+        async with self.db.execute("SELECT * FROM chats") as cur:
+            return await cur.fetchall()
+
+    async def save_rules(self, chat_id: int, raw_text: str, rules_json: str, owner_id: int) -> None:
+        """Save rules straight from the web panel; the first admin to save becomes the owner."""
+        await self.ensure_chat(chat_id)
+        await self.db.execute(
+            "UPDATE chats SET rules = ?, rules_json = ?, owner_id = COALESCE(owner_id, ?) WHERE chat_id = ?",
+            (raw_text, rules_json, owner_id, chat_id),
+        )
+        await self.db.commit()
+
     async def set_enabled(self, chat_id: int, enabled: bool) -> None:
         await self.set_setting(chat_id, "enabled", int(enabled))
 
@@ -162,12 +179,18 @@ class Storage:
 
     # --- trusted users ---
 
-    async def set_trusted(self, chat_id: int, user_id: int, trusted: bool) -> None:
+    async def set_trusted(self, chat_id: int, user_id: int, trusted: bool, name: str = "") -> None:
         if trusted:
-            await self.db.execute("INSERT OR IGNORE INTO trusted (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
+            await self.db.execute(
+                "INSERT OR REPLACE INTO trusted (chat_id, user_id, name) VALUES (?, ?, ?)", (chat_id, user_id, name)
+            )
         else:
             await self.db.execute("DELETE FROM trusted WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
         await self.db.commit()
+
+    async def list_trusted(self, chat_id: int) -> list[aiosqlite.Row]:
+        async with self.db.execute("SELECT user_id, name FROM trusted WHERE chat_id = ?", (chat_id,)) as cur:
+            return await cur.fetchall()
 
     async def is_trusted(self, chat_id: int, user_id: int) -> bool:
         async with self.db.execute(
@@ -218,6 +241,24 @@ class Storage:
         result = {row["action"]: row["n"] for row in rows}
         result["tokens"] = sum(row["t"] or 0 for row in rows)
         return result
+
+    async def recent_log(self, chat_id: int, limit: int = 40) -> list[aiosqlite.Row]:
+        """Deleted comments and comments waiting for the admin, newest first."""
+        actions = (*DELETING, "send_to_review")
+        marks = ", ".join("?" for _ in actions)
+        async with self.db.execute(
+            f"SELECT * FROM log WHERE chat_id = ? AND action IN ({marks}) ORDER BY id DESC LIMIT ?",
+            (chat_id, *actions, limit),
+        ) as cur:
+            return await cur.fetchall()
+
+    async def pending_review_count(self, chat_id: int) -> int:
+        async with self.db.execute(
+            "SELECT COUNT(*) FROM log WHERE chat_id = ? AND action = 'send_to_review' AND feedback IS NULL",
+            (chat_id,),
+        ) as cur:
+            (n,) = await cur.fetchone()
+        return n
 
     async def top_reasons(self, chat_id: int, since: int, limit: int = 3) -> list[tuple[str, int]]:
         marks = ", ".join("?" for _ in DELETING)

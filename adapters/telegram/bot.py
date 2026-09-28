@@ -21,7 +21,9 @@ from aiogram.types import (
     ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MenuButtonWebApp,
     Message,
+    WebAppInfo,
 )
 
 from core.jev_client import JevError
@@ -82,6 +84,7 @@ HELP_TEXT = (
     "/digest on|off — ежедневная сводка\n"
     "/check текст — что бы я сделал с таким комментарием\n"
     "/trust, /untrust — ответом на сообщение: не проверять этого человека\n"
+    "/panel — веб-панель: правила, настройки, журнал\n"
     "/stats — статистика за сутки, /off и /on — пауза"
 )
 
@@ -128,6 +131,8 @@ class TelegramAdapter:
         self.moderator = moderator
         self.storage = storage
         self._admins: dict[int, tuple[float, set[int]]] = {}
+        self._titles: dict[int, str] = {}
+        self.webapp_url = os.getenv("WEBAPP_URL", "").rstrip("/")
         self.router = Router()
         self._register()
 
@@ -138,9 +143,9 @@ class TelegramAdapter:
 
     # ------------------------------------------------------------------ helpers
 
-    async def is_admin(self, chat_id: int, user_id: int) -> bool:
+    async def is_admin(self, chat_id: int, user_id: int, fresh: bool = False) -> bool:
         cached = self._admins.get(chat_id)
-        if not cached or time.time() - cached[0] > ADMIN_CACHE_TTL:
+        if fresh or not cached or time.time() - cached[0] > ADMIN_CACHE_TTL:
             try:
                 members = await self.bot.get_chat_administrators(chat_id)
             except TelegramAPIError:
@@ -183,6 +188,32 @@ class TelegramAdapter:
             missing.append("банить и ограничивать пользователей")
         return missing
 
+    async def chat_title(self, chat_id: int) -> str:
+        if chat_id not in self._titles:
+            try:
+                self._titles[chat_id] = (await self.bot.get_chat(chat_id)).title or str(chat_id)
+            except TelegramAPIError:
+                return str(chat_id)
+        return self._titles[chat_id]
+
+    def panel_markup(self, chat_id: int | None = None) -> InlineKeyboardMarkup | None:
+        if not self.webapp_url:
+            return None
+        url = f"{self.webapp_url}/" + (f"?chat={chat_id}" if chat_id else "")
+        return InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⚙️ Открыть панель", web_app=WebAppInfo(url=url))]]
+        )
+
+    async def set_menu_button(self) -> None:
+        if not self.webapp_url:
+            return
+        try:
+            await self.bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="Панель", web_app=WebAppInfo(url=f"{self.webapp_url}/"))
+            )
+        except TelegramAPIError as e:
+            log.warning("Cannot set menu button: %s", e)
+
     async def config(self, chat_id: int) -> ChatConfig:
         return ChatConfig.from_row(await self.storage.get_chat(chat_id))
 
@@ -208,6 +239,7 @@ class TelegramAdapter:
         r.message(Command("useful"), GROUPS)(self.on_useful)
         r.message(Command("check"), GROUPS)(self.on_check)
         r.message(Command("trust", "untrust"), GROUPS)(self.on_trust)
+        r.message(Command("panel"))(self.on_panel)
         r.message(Command("off", "on"), GROUPS)(self.on_toggle)
         r.callback_query(F.data.startswith("rules:"))(self.on_rules_button)
         r.callback_query(F.data.startswith("appeal:"))(self.on_appeal)
@@ -216,7 +248,21 @@ class TelegramAdapter:
         r.message(GROUPS)(self.on_group_message)
 
     async def on_start(self, message: Message) -> None:
-        await message.answer(HELP_TEXT)
+        await message.answer(HELP_TEXT, reply_markup=self.panel_markup())
+
+    async def on_panel(self, message: Message) -> None:
+        if not self.webapp_url:
+            await message.reply("Веб-панель пока не настроена.")
+            return
+        if message.chat.type == ChatType.PRIVATE:
+            await message.answer("Панель управления:", reply_markup=self.panel_markup())
+            return
+        if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not await self.is_admin_message(message):
+            return
+        sent = await self.dm(message.from_user.id, "Панель управления этим чатом:", self.panel_markup(message.chat.id))
+        await message.reply(
+            "Отправил ссылку на панель вам в личку." if sent else "Напишите мне /start в личку, и повторите команду."
+        )
 
     async def on_bot_added(self, event: ChatMemberUpdated) -> None:
         if event.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -361,7 +407,7 @@ class TelegramAdapter:
             await message.reply("Ответьте этой командой на сообщение человека.")
             return
         trusted = command.command == "trust"
-        await self.storage.set_trusted(message.chat.id, target.id, trusted)
+        await self.storage.set_trusted(message.chat.id, target.id, trusted, target.full_name)
         name = html.escape(target.full_name)
         await message.reply(f"{name}: {'больше не проверяю' if trusted else 'снова проверяю'}.")
 
@@ -601,23 +647,46 @@ class TelegramAdapter:
         except TelegramAPIError as e:
             log.warning("Cannot lift restrictions: %s", e)
 
+    async def restore_comment(self, entry) -> None:
+        """The admin says the deletion was wrong: repost the text and undo the penalties."""
+        chat_id, user_id = entry["chat_id"], entry["user_id"]
+        await self.storage.set_feedback(entry["id"], "not_spam")
+        await self.storage.reset_deletions(chat_id, user_id)
+        if entry["action"] == ActionType.DELETE_AND_MUTE.value:
+            await self._lift_restrictions(chat_id, user_id)
+        elif entry["action"] == ActionType.DELETE_AND_BAN.value:
+            try:
+                await self.bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+            except TelegramAPIError as e:
+                log.warning("Cannot unban: %s", e)
+        # A deleted message cannot be restored, so the bot reposts its text.
+        try:
+            await self.bot.send_message(
+                chat_id,
+                f"↩️ Комментарий {html.escape(entry['user_name'] or '')} восстановлен админом:\n{quote(entry['text'])}",
+            )
+        except TelegramAPIError as e:
+            log.warning("Cannot restore comment: %s", e)
+
+    async def resolve_review(self, entry, delete: bool) -> str:
+        """The admin decides on a comment the bot was unsure about."""
+        if not delete:
+            await self.storage.set_feedback(entry["id"], "not_spam")
+            return "✅ Оставлено."
+        await self.storage.set_feedback(entry["id"], "confirmed")
+        try:
+            await self.bot.delete_message(entry["chat_id"], entry["message_id"])
+            await self.storage.count_message(entry["chat_id"], entry["user_id"], deleted=True)
+            return "🗑 Удалено."
+        except TelegramAPIError:
+            return "Не удалось удалить: сообщение уже удалено или прошло больше 48 часов."
+
     async def on_appeal_decision(self, call: CallbackQuery) -> None:
         entry = await self._owner_entry(call)
         if not entry:
             return
         if call.data.startswith("ap:ok"):
-            await self.storage.set_feedback(entry["id"], "not_spam")
-            await self.storage.reset_deletions(entry["chat_id"], entry["user_id"])
-            if entry["action"] == ActionType.DELETE_AND_MUTE.value:
-                await self._lift_restrictions(entry["chat_id"], entry["user_id"])
-            # A deleted message cannot be restored, so the bot reposts its text.
-            try:
-                await self.bot.send_message(
-                    entry["chat_id"],
-                    f"↩️ Комментарий {html.escape(entry['user_name'] or '')} восстановлен админом:\n{quote(entry['text'])}",
-                )
-            except TelegramAPIError as e:
-                log.warning("Cannot restore comment: %s", e)
+            await self.restore_comment(entry)
             await call.message.edit_text(call.message.html_text + "\n\n↩️ Комментарий восстановлен.")
         else:
             await self.storage.set_feedback(entry["id"], "confirmed")
@@ -628,17 +697,7 @@ class TelegramAdapter:
         entry = await self._owner_entry(call)
         if not entry:
             return
-        if call.data.startswith("rev:del"):
-            await self.storage.set_feedback(entry["id"], "confirmed")
-            try:
-                await self.bot.delete_message(entry["chat_id"], entry["message_id"])
-                await self.storage.count_message(entry["chat_id"], entry["user_id"], deleted=True)
-                result = "🗑 Удалено."
-            except TelegramAPIError:
-                result = "Не удалось удалить: сообщение уже удалено или прошло больше 48 часов."
-        else:
-            await self.storage.set_feedback(entry["id"], "not_spam")
-            result = "✅ Оставлено."
+        result = await self.resolve_review(entry, call.data.startswith("rev:del"))
         await call.message.edit_text(call.message.html_text + "\n\n" + result)
         await call.answer()
 

@@ -43,3 +43,22 @@ journalctl -u defenceai -f    # живые логи, выход Ctrl+C
 ## Обновление
 
 Снова скопировать проект и выполнить `bash deploy/install.sh`: `.env` и база `bot.db` не затрагиваются.
+
+## Веб-панель (Mini App)
+
+Нужен домен, который указывает на IP сервера (подойдёт бесплатный поддомен DuckDNS), и открытые порты 80 и 443.
+
+```bash
+cd /root/defenceai && git pull
+bash deploy/install.sh
+bash deploy/setup_https.sh defenceaibot.duckdns.org
+```
+
+Скрипт ставит Caddy (он сам получает и продлевает сертификат), прописывает `WEBAPP_URL` в `/opt/defenceai/.env`
+и перезапускает бота. После этого:
+
+- в личке с ботом появится кнопка «Панель» рядом с полем ввода;
+- команда `/panel` в группе присылает админу ссылку на панель именно этого чата.
+
+Если сертификат не выдаётся: проверь `journalctl -u caddy -f`, что домен указывает на IP сервера
+(`getent hosts defenceaibot.duckdns.org`) и что порты 80 и 443 открыты в панели хостера.
