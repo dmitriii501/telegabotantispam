@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DefenceAi: макет Mini App</title>
+<style>
+:root{
+  --bg:#f1f3f6; --card:#fff; --text:#17212b; --hint:#6b7a8a; --line:#e3e8ee;
+  --accent:#2f80ed; --accent-text:#fff; --good:#1e9e5a; --bad:#d64545; --warn:#c98a10;
+  --chip:#eef2f7;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#0f1720; --card:#17212b; --text:#e8eef4; --hint:#8a9aab; --line:#243140;
+        --accent:#4a9df8; --chip:#1f2c3a; --good:#39c07a; --bad:#f06a6a; --warn:#e3a92c;}
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.app{max-width:430px;margin:0 auto;min-height:100vh;padding-bottom:88px}
+header{padding:18px 16px 8px}
+header h1{margin:0;font-size:19px}
+header .sub{display:flex;align-items:center;gap:8px;color:var(--hint);margin-top:4px;font-size:13px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--good)}
+nav{display:flex;gap:4px;margin:8px 16px 12px;background:var(--chip);padding:4px;border-radius:12px}
+nav button{flex:1;border:0;background:none;color:var(--hint);padding:9px 0;border-radius:9px;font:inherit;font-weight:600;cursor:pointer}
+nav button.on{background:var(--card);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.12)}
+section{display:none;padding:0 16px}
+section.on{display:block}
+.card{background:var(--card);border-radius:14px;padding:12px 14px;margin-bottom:10px}
+.rule{display:flex;flex-direction:column;gap:8px}
+.rule .top{display:flex;gap:10px;align-items:flex-start}
+.rule .icon{font-size:18px;line-height:1.3}
+.rule .txt{flex:1;border:0;background:none;color:var(--text);font:inherit;padding:0;resize:none;width:100%;outline:none}
+.rule .del{border:0;background:none;color:var(--hint);font-size:18px;cursor:pointer;padding:0 2px}
+.rule .row{display:flex;gap:8px;align-items:center}
+select,.seg button,.btn{font:inherit}
+select{flex:1;background:var(--chip);color:var(--text);border:0;border-radius:9px;padding:8px 10px}
+.tag{font-size:12px;color:var(--hint)}
+.h{margin:16px 2px 8px;font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:var(--hint);font-weight:700}
+.btn{border:0;border-radius:11px;padding:11px 14px;font-weight:600;cursor:pointer}
+.btn.primary{background:var(--accent);color:var(--accent-text)}
+.btn.ghost{background:var(--chip);color:var(--text)}
+.btn.wide{width:100%}
+textarea.paste{width:100%;min-height:74px;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:12px;padding:10px;font:inherit;resize:vertical}
+.base{display:flex;gap:10px;align-items:center;color:var(--hint);font-size:13px}
+.set{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--line)}
+.set:last-child{border-bottom:0}
+.set small{display:block;color:var(--hint);font-size:12px;margin-top:2px}
+.sw{position:relative;width:46px;height:28px;flex:none}
+.sw input{opacity:0;position:absolute;inset:0;margin:0;cursor:pointer;z-index:1}
+.sw i{position:absolute;inset:0;background:var(--line);border-radius:14px;transition:.15s}
+.sw i:after{content:"";position:absolute;left:3px;top:3px;width:22px;height:22px;border-radius:50%;background:#fff;transition:.15s;box-shadow:0 1px 2px rgba(0,0,0,.3)}
+.sw input:checked+i{background:var(--good)}
+.sw input:checked+i:after{left:21px}
+.seg{display:flex;background:var(--chip);border-radius:10px;padding:3px;margin-top:8px}
+.seg button{flex:1;border:0;background:none;color:var(--hint);padding:7px 0;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px}
+.seg button.on{background:var(--card);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.15)}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px}
+.stat{background:var(--card);border-radius:14px;padding:12px 8px;text-align:center}
+.stat b{display:block;font-size:22px}
+.stat span{font-size:11px;color:var(--hint)}
+.entry .who{display:flex;justify-content:space-between;font-size:13px;color:var(--hint)}
+.entry blockquote{margin:6px 0;padding:0 0 0 10px;border-left:3px solid var(--line)}
+.pill{display:inline-block;font-size:12px;padding:2px 8px;border-radius:20px;background:var(--chip)}
+.pill.bad{color:var(--bad)} .pill.warn{color:var(--warn)} .pill.good{color:var(--good)}
+.entry .acts{display:flex;gap:8px;margin-top:8px}
+.entry .acts .btn{flex:1;padding:8px}
+.savebar{position:fixed;left:0;right:0;bottom:0;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:linear-gradient(transparent,var(--bg) 30%)}
+.savebar .in{max-width:430px;margin:0 auto}
+.toast{position:fixed;left:50%;bottom:84px;transform:translateX(-50%) translateY(20px);background:#17212b;color:#fff;padding:9px 16px;border-radius:20px;opacity:0;transition:.2s;pointer-events:none;font-size:14px}
+.toast.on{opacity:1;transform:translateX(-50%)}
+.note{font-size:12px;color:var(--hint);text-align:center;margin:18px 16px 0}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Крипто-канал «Биток»</h1>
+    <div class="sub"><span class="dot"></span> Модерация включена · проверено сегодня 412</div>
+  </header>
+  <nav id="tabs">
+    <button class="on" data-t="rules">Правила</button>
+    <button data-t="settings">Настройки</button>
+    <button data-t="log">Журнал</button>
+  </nav>
+
+  <!-- ПРАВИЛА -->
+  <section id="rules" class="on">
+    <div class="h">Правила канала</div>
+    <div id="ruleList"></div>
+    <div class="card base"><span>🛡</span><span>Спам, казино, наркотики и мошенничество удаляются всегда. Это правило нельзя отключить.</span></div>
+    <button class="btn ghost wide" id="add">＋ Добавить правило</button>
+
+    <div class="h">Или вставьте текстом</div>
+    <textarea class="paste" id="paste" placeholder="Например: рекламу нельзя — бан, политику — удалять"></textarea>
+    <button class="btn ghost wide" style="margin-top:8px" id="parse">Разобрать текст на правила</button>
+  </section>
+
+  <!-- НАСТРОЙКИ -->
+  <section id="settings">
+    <div class="h">Строгость</div>
+    <div class="card">
+      <div>Насколько уверенно удалять</div>
+      <div class="seg" id="mode">
+        <button data-v="soft">Мягко</button><button data-v="normal" class="on">Обычно</button><button data-v="strict">Строго</button>
+      </div>
+      <div class="tag" style="margin-top:8px" id="modeHint">Сомнительные комментарии бот присылает вам.</div>
+    </div>
+    <div class="h">Поведение</div>
+    <div class="card">
+      <div class="set"><div>Режим тишины<small>Удалять все сообщения не-админов</small></div><label class="sw"><input type="checkbox"><i></i></label></div>
+      <div class="set"><div>Мут и бан за повторы<small>3-е нарушение — мут на сутки, 5-е — бан</small></div><label class="sw"><input type="checkbox" checked><i></i></label></div>
+      <div class="set"><div>Ежедневная сводка<small>Каждый день в 09:00 по Москве</small></div><label class="sw"><input type="checkbox" checked><i></i></label></div>
+    </div>
+    <div class="h">Полезные комментарии</div>
+    <div class="card">
+      <div class="seg" id="useful">
+        <button data-v="digest" class="on">В сводку</button><button data-v="instant">Сразу</button><button data-v="off">Не нужно</button>
+      </div>
+    </div>
+    <div class="h">Не проверять</div>
+    <div class="card">
+      <div class="set"><div>Анна Петрова<small>@anna_p · добавлена вами</small></div><button class="btn ghost" style="padding:6px 10px">Убрать</button></div>
+      <div class="set"><div>Модератор Игорь<small>@igor_mod</small></div><button class="btn ghost" style="padding:6px 10px">Убрать</button></div>
+    </div>
+  </section>
+
+  <!-- ЖУРНАЛ -->
+  <section id="log">
+    <div class="stats">
+      <div class="stat"><b>412</b><span>проверено</span></div>
+      <div class="stat"><b>37</b><span>удалено</span></div>
+      <div class="stat"><b>5</b><span>ждут вас</span></div>
+    </div>
+    <div class="h">Ждут вашего решения</div>
+    <div class="card entry">
+      <div class="who"><span>Кто вчера смотрел футбол?</span><span class="pill warn">не уверен · 71%</span></div>
+      <blockquote>Кто вчера смотрел футбол? Какой матч был!</blockquote>
+      <span class="tag">Правило: «Не по теме поста»</span>
+      <div class="acts"><button class="btn primary">🗑 Удалить</button><button class="btn ghost">✅ Оставить</button></div>
+    </div>
+    <div class="h">Последние удаления</div>
+    <div class="card entry">
+      <div class="who"><span>Кирилл Т.</span><span class="pill bad">бан · 99%</span></div>
+      <blockquote>Зaрaбoтoк без вложений, пиши в лс 💸</blockquote>
+      <span class="tag">Спам или реклама · бот 87%</span>
+      <div class="acts"><button class="btn ghost">↩️ Вернуть</button><button class="btn ghost">⭐ Доверять</button></div>
+    </div>
+    <div class="card entry">
+      <div class="who"><span>Дмитрий</span><span class="pill warn">предупреждение · 98%</span></div>
+      <blockquote>Ты вообще дебил, пишешь полную чушь</blockquote>
+      <span class="tag">Правило: «Оскорбления»</span>
+      <div class="acts"><button class="btn ghost">↩️ Вернуть</button><button class="btn ghost">⭐ Доверять</button></div>
+    </div>
+    <div class="card entry">
+      <div class="who"><span>Мария</span><span class="pill">удалено · 99%</span></div>
+      <blockquote>Путин опять что-то подписал, вот увидите…</blockquote>
+      <span class="tag">Правило: «Политика»</span>
+      <div class="acts"><button class="btn ghost">↩️ Вернуть</button><button class="btn ghost">⭐ Доверять</button></div>
+    </div>
+  </section>
+
+  <p class="note">Это макет с демо-данными. В настоящем Mini App цвета подстроятся под тему Telegram.</p>
+</div>
+
+<div class="savebar"><div class="in"><button class="btn primary wide" id="save">Сохранить изменения</button></div></div>
+<div class="toast" id="toast">Сохранено ✅</div>
+
+<script>
+const ACTIONS = {ban:"Удалять и банить", mute:"Удалять и мутить на сутки", warn:"Удалять с предупреждением",
+                 delete:"Просто удалять", review:"Присылать мне на проверку", auto:"Решит бот по ситуации"};
+const KINDS = {prohibition:["❌","Запрет"], permission:["✅","Разрешено"], context:["ℹ️","Описание канала"]};
+let rules = [
+  {kind:"context", text:"Канал про крипту"},
+  {kind:"permission", text:"Мат можно"},
+  {kind:"prohibition", text:"Реклама других каналов", action:"ban"},
+  {kind:"prohibition", text:"Политика", action:"delete"},
+  {kind:"prohibition", text:"Оскорбления", action:"warn"},
+  {kind:"prohibition", text:"Всё не по теме поста", action:"review"},
+];
+const $ = s => document.querySelector(s);
+function render(){
+  $("#ruleList").innerHTML = rules.map((r,i)=>`
+    <div class="card rule">
+      <div class="top">
+        <span class="icon">${KINDS[r.kind][0]}</span>
+        <textarea class="txt" rows="1" data-i="${i}">${r.text}</textarea>
+        <button class="del" data-del="${i}" title="Удалить">✕</button>
+      </div>
+      <div class="row">
+        <select data-kind="${i}">${Object.entries(KINDS).map(([k,v])=>`<option value="${k}" ${k==r.kind?"selected":""}>${v[1]}</option>`).join("")}</select>
+        ${r.kind=="prohibition" ? `<select data-act="${i}">${Object.entries(ACTIONS).map(([k,v])=>`<option value="${k}" ${k==(r.action||"auto")?"selected":""}>${v}</option>`).join("")}</select>` : ""}
+      </div>
+    </div>`).join("");
+}
+render();
+$("#ruleList").addEventListener("input", e=>{ if(e.target.dataset.i) rules[e.target.dataset.i].text = e.target.value; });
+$("#ruleList").addEventListener("change", e=>{
+  if(e.target.dataset.kind){ rules[e.target.dataset.kind].kind = e.target.value; render(); }
+  if(e.target.dataset.act){ rules[e.target.dataset.act].action = e.target.value; }
+});
+$("#ruleList").addEventListener("click", e=>{ if(e.target.dataset.del){ rules.splice(e.target.dataset.del,1); render(); } });
+$("#add").onclick = ()=>{ rules.push({kind:"prohibition", text:"Новое правило", action:"auto"}); render(); };
+$("#parse").onclick = ()=>{
+  const t = $("#paste").value.trim(); if(!t) return;
+  t.split(/[\n;.]+/).map(s=>s.trim()).filter(Boolean).forEach(s=>{
+    const a = /бан/i.test(s)?"ban":/мут/i.test(s)?"mute":/предупре/i.test(s)?"warn":/удал/i.test(s)?"delete":/присл/i.test(s)?"review":"auto";
+    const k = /можно|разреш/i.test(s)?"permission":"prohibition";
+    rules.push({kind:k, text:s, action:a});
+  });
+  $("#paste").value=""; render(); toast("Правила добавлены. Проверьте действия");
+};
+document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("#tabs button,section").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on"); $("#"+b.dataset.t).classList.add("on");
+});
+const hints={soft:"Почти всё сомнительное бот присылает вам.",normal:"Сомнительные комментарии бот присылает вам.",strict:"Бот удаляет даже при небольшой уверенности."};
+document.querySelectorAll(".seg").forEach(seg=>seg.addEventListener("click", e=>{
+  if(e.target.tagName!="BUTTON") return;
+  seg.querySelectorAll("button").forEach(x=>x.classList.remove("on")); e.target.classList.add("on");
+  if(seg.id=="mode") $("#modeHint").textContent = hints[e.target.dataset.v];
+}));
+function toast(t){ const el=$("#toast"); el.textContent=t; el.classList.add("on"); setTimeout(()=>el.classList.remove("on"),1800); }
+$("#save").onclick = ()=>toast("Сохранено ✅");
+document.querySelectorAll(".entry .btn").forEach(b=>b.onclick=()=>toast("Готово ✅"));
+</script>
+</body>
+</html>
