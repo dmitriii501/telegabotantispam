@@ -77,6 +77,7 @@ class ChatConfig:
     mode: str = "normal"
     lockdown: bool = False  # delete everything from non-admins
     escalation: bool = True
+    conflicts: bool = True  # warn the owner when a discussion heats up
 
     @property
     def prohibitions(self) -> list[Rule]:
@@ -104,7 +105,29 @@ class ChatConfig:
             mode=row["mode"] or "normal",
             lockdown=bool(row["lockdown"]),
             escalation=bool(row["escalation"]),
+            conflicts=_column(row, "conflicts", 1) == 1,
         )
+
+
+TENSION_QUESTION = {
+    "type": "score",
+    "instructions": "Насколько накалено обсуждение в `discussion`?",
+    "criteria": [
+        "Спокойное обсуждение, участники согласны или вежливо делятся мнениями",
+        "Спор: мнения расходятся, тон резкий, но без взаимных оскорблений",
+        "Ссора: участники оскорбляют друг друга или переходят на личности",
+    ],
+}
+TENSION_ALERT = 1.4  # score at or above this warns the owner
+TENSION_MIN_CONFIDENCE = 0.5
+
+
+def _column(row: Mapping, name: str, default):
+    try:
+        value = row[name]
+    except (KeyError, IndexError):
+        return default
+    return default if value is None else value
 
 
 def needs_check(text: str) -> bool:
@@ -257,13 +280,18 @@ class Moderator:
     def __init__(self, jev: JevClient):
         self.jev = jev
 
-    async def check(self, comment: Comment, config: ChatConfig) -> Decision:
+    async def check(self, comment: Comment, config: ChatConfig, known: str | None = None) -> Decision:
+        """`known` is what the admin (or the bot itself) already decided about this exact text."""
         if config.lockdown:
             return _blanket_decision(None, "включён режим тишины")
         if config.blanket:
             return _blanket_decision(config.blanket, f"правило «{config.blanket.text.rstrip('.!; ')}»")
         if not needs_check(comment.text):
             return Decision(ActionType.NONE)
+        if known == "allow":
+            return Decision(ActionType.NONE, None, "админ уже разрешил такой комментарий")
+        if known == "remove":
+            return _blanket_decision(Rule("", PROHIBITION, "delete"), "такой комментарий уже удаляли")
         prohibitions = config.prohibitions
         response = await self.jev.ask(build_state(comment, config.rules), build_questions(prohibitions))
         return decide(
@@ -281,3 +309,9 @@ class Moderator:
             return []
         response = await self.jev.ask({"rules_text": admin_text}, build_parse_questions(sentences))
         return parse_rules_response(sentences, response)
+
+    async def tension(self, messages: list[dict]) -> tuple[float, float]:
+        """How heated a discussion is: (score 0..2, confidence). `messages` are {"author", "text"} dicts."""
+        response = await self.jev.ask({"discussion": messages}, {"tension": TENSION_QUESTION})
+        answer = response["answers"]["tension"]
+        return float(answer["score"]), float(answer["confidence"])

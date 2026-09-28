@@ -34,8 +34,11 @@ chown -R defenceai:defenceai "$APP_DIR"
 chmod 600 "$APP_DIR/.env"
 
 cp deploy/defenceai.service /etc/systemd/system/$SERVICE.service
+cp deploy/defenceai-backup.service deploy/defenceai-backup.timer /etc/systemd/system/
+chmod +x "$APP_DIR/deploy/backup.sh"
 systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null
+systemctl enable --now defenceai-backup.timer >/dev/null
 systemctl restart "$SERVICE"
 echo
 echo "Installed. Status:  systemctl status $SERVICE    Logs:  journalctl -u $SERVICE -f"

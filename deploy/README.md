@@ -62,3 +62,21 @@ bash deploy/setup_https.sh defenceaibot.duckdns.org
 
 Если сертификат не выдаётся: проверь `journalctl -u caddy -f`, что домен указывает на IP сервера
 (`getent hosts defenceaibot.duckdns.org`) и что порты 80 и 443 открыты в панели хостера.
+
+## Резервные копии
+
+`deploy/install.sh` включает таймер: каждый день в 03:30 база копируется в `/var/backups/defenceai/`
+(хранится 14 дней, файлы `bot-ГГГГ-ММ-ДД.db.gz`). Проверить: `systemctl list-timers defenceai-backup.timer`,
+запустить вручную: `systemctl start defenceai-backup.service`.
+
+Восстановление:
+
+```bash
+systemctl stop defenceai
+gunzip -c /var/backups/defenceai/bot-ГГГГ-ММ-ДД.db.gz > /opt/defenceai/bot.db
+chown defenceai:defenceai /opt/defenceai/bot.db
+systemctl start defenceai
+```
+
+Копии лежат на том же сервере, поэтому от потери самого сервера они не защищают:
+время от времени скачивай свежий файл к себе (`scp -i servak.pem root@IP:/var/backups/defenceai/bot-*.db.gz .`).

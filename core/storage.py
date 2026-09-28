@@ -4,6 +4,8 @@ import time
 
 import aiosqlite
 
+from core.normalizer import example_key
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chats (
     chat_id INTEGER PRIMARY KEY,
@@ -47,6 +49,13 @@ CREATE TABLE IF NOT EXISTS posts (
     text TEXT NOT NULL,
     PRIMARY KEY (chat_id, message_id)
 );
+CREATE TABLE IF NOT EXISTS examples (
+    chat_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    kind TEXT NOT NULL,  -- 'allow' or 'remove'
+    ts INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, key)
+);
 CREATE TABLE IF NOT EXISTS trusted (
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -65,6 +74,7 @@ CHAT_COLUMNS = [
     ("digest", "INTEGER NOT NULL DEFAULT 1"),
     ("useful_mode", "TEXT NOT NULL DEFAULT 'digest'"),
     ("digest_last", "TEXT"),
+    ("conflicts", "INTEGER NOT NULL DEFAULT 1"),
 ]
 SETTINGS = {name for name, _ in CHAT_COLUMNS} - {"rules_json", "pending_json", "digest_last"} | {"enabled"}
 
@@ -229,8 +239,25 @@ class Storage:
             return await cur.fetchone()
 
     async def set_feedback(self, log_id: int, feedback: str) -> None:
+        """Record the admin's decision; it is also remembered for identical comments later."""
         await self.db.execute("UPDATE log SET feedback = ? WHERE id = ?", (feedback, log_id))
         await self.db.commit()
+        entry = await self.get_log(log_id)
+        key = example_key(entry["text"]) if entry else None
+        if key and feedback in ("not_spam", "confirmed"):
+            await self.add_example(entry["chat_id"], key, "allow" if feedback == "not_spam" else "remove")
+
+    async def add_example(self, chat_id: int, key: str, kind: str) -> None:
+        await self.db.execute(
+            "INSERT OR REPLACE INTO examples (chat_id, key, kind, ts) VALUES (?, ?, ?, ?)",
+            (chat_id, key, kind, int(time.time())),
+        )
+        await self.db.commit()
+
+    async def example_kind(self, chat_id: int, key: str) -> str | None:
+        async with self.db.execute("SELECT kind FROM examples WHERE chat_id = ? AND key = ?", (chat_id, key)) as cur:
+            row = await cur.fetchone()
+        return row["kind"] if row else None
 
     async def stats(self, chat_id: int, since: int) -> dict[str, int]:
         async with self.db.execute(

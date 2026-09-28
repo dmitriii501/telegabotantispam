@@ -9,6 +9,7 @@ import html
 import logging
 import os
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -28,7 +29,8 @@ from aiogram.types import (
 
 from core.jev_client import JevError
 from core.models import DELETING_ACTIONS, ActionType, Author, Comment, Decision
-from core.moderation import MODES, ChatConfig, Moderator
+from core.moderation import MODES, TENSION_ALERT, TENSION_MIN_CONFIDENCE, ChatConfig, Moderator
+from core.normalizer import example_key
 from core.rules import CONTEXT, EVERYTHING, PERMISSION, Rule, rules_to_json
 from core.storage import DAY, Storage
 
@@ -38,6 +40,14 @@ GROUPS = F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP})
 EXPLANATION_TTL = 60  # seconds before the "comment deleted" notice disappears
 ADMIN_CACHE_TTL = 600
 DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", "6"))  # 06:00 UTC = 09:00 Moscow
+
+# Conflict alerts: a busy thread is scored by Jev, at most every RECHECK seconds.
+CONFLICT_WINDOW = 15 * 60  # only messages this recent count
+CONFLICT_MIN_MESSAGES = 6
+CONFLICT_RECHECK = 5 * 60
+CONFLICT_COOLDOWN = 60 * 60  # do not warn about the same thread twice in an hour
+THREAD_BUFFER = 30
+AUTO_REMEMBER_CONFIDENCE = 0.95  # bans this sure are remembered, so copies of the spam skip Jev
 
 ACTION_LABEL = {
     "ban": "удалять и банить",
@@ -82,6 +92,7 @@ HELP_TEXT = (
     "/escalation on|off — мут и бан за повторные нарушения\n"
     "/useful digest|instant|off — полезные комментарии: в сводку, сразу или никак\n"
     "/digest on|off — ежедневная сводка\n"
+    "/conflicts on|off — предупреждать, когда обсуждение накаляется\n"
     "/check текст — что бы я сделал с таким комментарием\n"
     "/trust, /untrust — ответом на сообщение: не проверять этого человека\n"
     "/panel — веб-панель: правила, настройки, журнал\n"
@@ -132,6 +143,9 @@ class TelegramAdapter:
         self.storage = storage
         self._admins: dict[int, tuple[float, set[int]]] = {}
         self._titles: dict[int, str] = {}
+        self._threads: dict[tuple[int, int], deque] = {}
+        self._checked: dict[tuple[int, int], float] = {}
+        self._alerted: dict[tuple[int, int], float] = {}
         self.webapp_url = os.getenv("WEBAPP_URL", "").rstrip("/")
         self.router = Router()
         self._register()
@@ -239,6 +253,7 @@ class TelegramAdapter:
         r.message(Command("useful"), GROUPS)(self.on_useful)
         r.message(Command("check"), GROUPS)(self.on_check)
         r.message(Command("trust", "untrust"), GROUPS)(self.on_trust)
+        r.message(Command("conflicts"), GROUPS)(self.on_conflicts)
         r.message(Command("panel"))(self.on_panel)
         r.message(Command("off", "on"), GROUPS)(self.on_toggle)
         r.callback_query(F.data.startswith("rules:"))(self.on_rules_button)
@@ -349,7 +364,8 @@ class TelegramAdapter:
             f"Режим тишины: {on_off(config.lockdown)}\n"
             f"Мут и бан за повторные нарушения: {on_off(config.escalation)}\n"
             f"Полезные комментарии: {useful[chat['useful_mode'] if chat else 'digest']}\n"
-            f"Ежедневная сводка: {on_off(not chat or bool(chat['digest']))}\n\n"
+            f"Ежедневная сводка: {on_off(not chat or bool(chat['digest']))}\n"
+            f"Предупреждения о ссорах: {on_off(config.conflicts)}\n\n"
             f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам — всегда"
         )
 
@@ -378,6 +394,9 @@ class TelegramAdapter:
 
     async def on_escalation(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "escalation", "Мут и бан за повторные нарушения")
+
+    async def on_conflicts(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "conflicts", "Предупреждения о ссорах")
 
     async def on_digest(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "digest", "Ежедневная сводка")
@@ -495,6 +514,8 @@ class TelegramAdapter:
 
         messages, deletions = await self.storage.user_counters(chat_id, user.id)
         config = ChatConfig.from_row(chat)
+        key = example_key(text)
+        known = await self.storage.example_kind(chat_id, key) if key else None
         post_text, reply_to_text = (None, None)
         if not config.lockdown and not config.blanket:
             post_text, reply_to_text = await self.comment_context(message)
@@ -514,13 +535,15 @@ class TelegramAdapter:
             reply_to_text=reply_to_text,
         )
         try:
-            decision = await self.moderator.check(comment, config)
+            decision = await self.moderator.check(comment, config, known)
         except JevError as e:
             log.error("Moderation failed, letting the comment through: %s", e)
             return
 
         deleted = decision.action in DELETING_ACTIONS
         await self.storage.count_message(chat_id, user.id, deleted)
+        if not deleted:
+            asyncio.create_task(self.watch_thread(message, text, config, chat))
         if decision.verdict is None:
             return  # skipped without calling Jev
         v = decision.verdict
@@ -538,7 +561,64 @@ class TelegramAdapter:
             tokens=v.input_tokens,
         )
         log.info("chat=%s user=%s action=%s %s", chat_id, user.id, decision.action.value, v)
+        if key and decision.action == ActionType.DELETE_AND_BAN and v.confidence >= AUTO_REMEMBER_CONFIDENCE:
+            await self.storage.add_example(chat_id, key, "remove")
         await self.execute(message, decision, log_id, chat)
+
+    # ---------------------------------------------------------- conflict alerts
+
+    @staticmethod
+    def thread_of(message: Message) -> int:
+        parent = message.reply_to_message
+        if message.message_thread_id:
+            return message.message_thread_id
+        return parent.message_id if parent and parent.is_automatic_forward else 0
+
+    def _prune_threads(self, now: float) -> None:
+        for key in [k for k, buf in self._threads.items() if not buf or now - buf[-1][0] > 2 * 3600]:
+            self._threads.pop(key, None)
+            self._checked.pop(key, None)
+            self._alerted.pop(key, None)
+
+    async def watch_thread(self, message: Message, text: str, config: ChatConfig, chat) -> None:
+        """Remember the message and, when the thread is busy, ask Jev whether it is heating up."""
+        try:
+            chat_id = message.chat.id
+            thread = (chat_id, self.thread_of(message))
+            now = time.time()
+            buf = self._threads.setdefault(thread, deque(maxlen=THREAD_BUFFER))
+            buf.append((now, message.from_user.full_name, text[:300]))
+            if len(self._threads) > 500:
+                self._prune_threads(now)
+            owner_id = chat["owner_id"] if chat else None
+            if not config.conflicts or not owner_id:
+                return
+            recent = [item for item in buf if now - item[0] <= CONFLICT_WINDOW]
+            if (
+                len(recent) < CONFLICT_MIN_MESSAGES
+                or now - self._checked.get(thread, 0) < CONFLICT_RECHECK
+                or now - self._alerted.get(thread, 0) < CONFLICT_COOLDOWN
+            ):
+                return
+            self._checked[thread] = now
+            score, confidence = await self.moderator.tension(
+                [{"author": name, "text": t} for _, name, t in recent[-15:]]
+            )
+            if score < TENSION_ALERT or confidence < TENSION_MIN_CONFIDENCE:
+                return
+            self._alerted[thread] = now
+            post = await self.storage.get_post(chat_id, thread[1]) if thread[1] else None
+            where = f" под постом «{html.escape(post[:80])}…»" if post else ""
+            people = len({name for _, name, _ in recent})
+            link = chat_message_link(chat_id, message.message_id, message.chat.username)
+            await self.dm(
+                owner_id,
+                f"🔥 Разгорается конфликт{where}: {len(recent)} сообщений от {people} участников за "
+                f"{CONFLICT_WINDOW // 60} минут, тон резкий.\n{link}\n\n"
+                "Если нужно остановить, включите режим тишины: /lockdown on",
+            )
+        except Exception:  # background task: never let it crash the handler
+            log.exception("Conflict check failed")
 
     async def execute(self, message: Message, decision: Decision, log_id: int, chat) -> None:
         action = decision.action

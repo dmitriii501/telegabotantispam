@@ -27,7 +27,7 @@ MAX_RULE_LENGTH = 300
 MAX_PARSE_LENGTH = 2000
 KINDS = {PROHIBITION, PERMISSION, CONTEXT, EVERYTHING}
 USEFUL_MODES = {"digest", "instant", "off"}
-BOOL_SETTINGS = ("lockdown", "escalation", "digest", "enabled")
+BOOL_SETTINGS = ("lockdown", "escalation", "digest", "enabled", "conflicts")
 DELETING = {a.value for a in DELETING_ACTIONS}
 
 CSP = (
@@ -130,6 +130,7 @@ def chat_payload(chat, trusted) -> dict:
             "mode": config.mode,
             "lockdown": config.lockdown,
             "escalation": config.escalation,
+            "conflicts": config.conflicts,
             "digest": bool(chat["digest"]),
             "useful_mode": chat["useful_mode"],
             "enabled": bool(chat["enabled"]),

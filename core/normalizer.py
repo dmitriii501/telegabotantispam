@@ -4,6 +4,7 @@ The model gets both the original and the normalized text, so normalization only
 has to help, never to be perfect.
 """
 
+import hashlib
 import re
 import unicodedata
 
@@ -54,3 +55,17 @@ def normalize(text: str) -> str:
 def is_obfuscated(text: str) -> bool:
     """True when normalization changed something: itself a spam signal."""
     return normalize(text) != unicodedata.normalize("NFKC", text)
+
+
+MIN_KEY_LENGTH = 12
+
+
+def example_key(text: str) -> str | None:
+    """Stable key for "the same comment": letters and digits only, restored, lowercased.
+
+    Spam waves repeat one text with tiny changes in spacing and punctuation.
+    Very short texts ("ок", "спасибо") are never remembered.
+    """
+    words = re.findall(r"\w+", normalize(text).lower())
+    key = " ".join(words)
+    return hashlib.sha1(key.encode()).hexdigest() if len(key) >= MIN_KEY_LENGTH else None

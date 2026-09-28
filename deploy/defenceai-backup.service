@@ -1,0 +1,6 @@
+[Unit]
+Description=DefenceAi database backup
+
+[Service]
+Type=oneshot
+ExecStart=/opt/defenceai/deploy/backup.sh
