@@ -271,6 +271,21 @@ function toggle(key, title, hint) {
     <label class="sw"><input type="checkbox" data-set="${key}" ${on ? "checked" : ""}><i></i></label></div>`;
 }
 
+const FLOOD_FIELDS = [
+  ["flood_messages", "Сообщений подряд", 3, 30],
+  ["flood_window", "За сколько секунд", 5, 120],
+  ["flood_mute", "Мут, минут", 1, 10080],
+];
+
+function floodFields() {
+  const s = state.data.settings;
+  if (!s.antiflood) return "";
+  return `<div class="set flood">${FLOOD_FIELDS.map(
+    ([key, label, low, high]) => `<label class="num"><small>${label}</small>
+      <input type="number" inputmode="numeric" min="${low}" max="${high}" value="${esc(s[key])}" data-int="${key}"></label>`
+  ).join("")}</div>`;
+}
+
 function segmented(key, options) {
   const cur = state.data.settings[key];
   return `<div class="seg">${options
@@ -295,7 +310,8 @@ function renderSettings() {
     <div class="card">
       ${toggle("enabled", "Модерация", "Выключите, чтобы бот временно ничего не проверял")}
       ${toggle("observe", "Режим наблюдения", "Бот ничего не удаляет, только записывает, что сделал бы. Итог в /report")}
-      ${toggle("antiflood", "Антифлуд", "Мут на 30 минут за 6 сообщений подряд за 20 секунд")}
+      ${toggle("antiflood", "Антифлуд", "Мут за много сообщений подряд. Пороги ниже настраиваются")}
+      ${floodFields()}
       ${toggle("analytics", "Аналитика комментариев", "Тип, тон и «ждёт ответа» для каждого комментария")}
       ${toggle("lockdown", "Режим тишины", "Удалять все сообщения не-админов")}
       ${toggle("escalation", "Мут и бан за повторы", "3-е нарушение — мут на сутки, 5-е — бан")}
@@ -315,6 +331,11 @@ function renderSettings() {
   };
   view.onchange = (e) => {
     if (e.target.dataset.set) saveSetting(e.target.dataset.set, e.target.checked);
+    if (e.target.dataset.int) {
+      const [, , low, high] = FLOOD_FIELDS.find((f) => f[0] === e.target.dataset.int);
+      const value = Math.min(high, Math.max(low, parseInt(e.target.value, 10) || low));
+      saveSetting(e.target.dataset.int, value);
+    }
   };
 }
 

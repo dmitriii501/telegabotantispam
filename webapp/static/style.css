@@ -72,3 +72,6 @@ textarea.paste{width:100%;min-height:74px;border:1px solid var(--line);backgroun
 .bar .track{flex:1;height:8px;background:var(--chip);border-radius:6px;overflow:hidden}
 .bar .fill{height:100%;background:var(--accent);border-radius:6px}
 .bar b{width:34px;text-align:right}
+.flood{gap:8px;align-items:flex-end}
+.num{display:flex;flex-direction:column;gap:4px;flex:1;min-width:0}
+.num input{width:100%;background:var(--chip);color:var(--text);border:0;border-radius:9px;padding:8px 10px;font:inherit}

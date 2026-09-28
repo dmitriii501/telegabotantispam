@@ -27,6 +27,7 @@ MAX_RULE_LENGTH = 300
 MAX_PARSE_LENGTH = 2000
 KINDS = {PROHIBITION, PERMISSION, CONTEXT, EVERYTHING}
 USEFUL_MODES = {"digest", "instant", "off"}
+INT_SETTINGS = {"flood_messages": (3, 30), "flood_window": (5, 120), "flood_mute": (1, 10080)}
 BOOL_SETTINGS = ("lockdown", "escalation", "digest", "enabled", "conflicts", "antiflood", "analytics", "observe")
 DELETING = {a.value for a in DELETING_ACTIONS}
 
@@ -132,6 +133,9 @@ def chat_payload(chat, trusted) -> dict:
             "escalation": config.escalation,
             "conflicts": config.conflicts,
             "antiflood": config.antiflood,
+            "flood_messages": config.flood_messages,
+            "flood_window": config.flood_window,
+            "flood_mute": config.flood_mute_minutes,
             "analytics": config.analytics,
             "observe": config.observe,
             "digest": bool(chat["digest"]),
@@ -190,6 +194,11 @@ async def put_settings(request: web.Request) -> web.Response:
             updates[key] = value
         elif key in BOOL_SETTINGS and isinstance(value, bool):
             updates[key] = int(value)
+        elif key in INT_SETTINGS and isinstance(value, int) and not isinstance(value, bool):
+            low, high = INT_SETTINGS[key]
+            if not low <= value <= high:
+                raise ApiError(400, f"{key}: допустимо от {low} до {high}")
+            updates[key] = value
         else:
             raise ApiError(400, f"Некорректная настройка: {key}")
     storage = request.app["adapter"].storage

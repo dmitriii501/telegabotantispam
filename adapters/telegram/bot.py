@@ -49,9 +49,11 @@ CONFLICT_COOLDOWN = 60 * 60  # do not warn about the same thread twice in an hou
 THREAD_BUFFER = 30
 AUTO_REMEMBER_CONFIDENCE = 0.95  # bans this sure are remembered, so copies of the spam skip Jev
 
-# Antiflood: this many messages from one author within this many seconds.
+# Antiflood defaults; every chat can change them. The limits keep the settings sane.
 FLOOD_MESSAGES = 6
 FLOOD_WINDOW = 20
+FLOOD_MUTE_MINUTES = 30
+FLOOD_LIMITS = {"messages": (3, 30), "window": (5, 120), "mute": (1, 10080)}
 JEV_ALERT_COOLDOWN = 60 * 60  # tell the owner about a Jev outage at most once an hour
 RIGHTS_ALERT_COOLDOWN = 6 * 60 * 60
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))  # comment texts are deleted after this long
@@ -110,7 +112,8 @@ HELP_TEXT = (
     "/conflicts on|off — предупреждать, когда обсуждение накаляется\n"
     "/observe on|off — режим наблюдения: ничего не удалять, только записывать\n"
     "/report — отчёт за 7 дней\n"
-    "/antiflood on|off — мут за флуд, /analytics on|off — типы и тон комментариев\n"
+    "/antiflood [5 10 60|off] — мут за флуд: сообщений, секунд, минут мута (или показать настройку)\n"
+    "/analytics on|off — типы и тон комментариев\n"
     "/check текст — что бы я сделал с таким комментарием\n"
     "/trust, /untrust — ответом на сообщение: не проверять этого человека\n"
     "/panel — веб-панель: правила, настройки, журнал\n"
@@ -148,6 +151,21 @@ def describe_rule(rule: Rule) -> str:
 
 def describe_rules(rules: list[Rule]) -> str:
     return "\n".join(describe_rule(r) for r in rules) or "правила не заданы"
+
+
+ANTIFLOOD_HELP = (
+    "Изменить: <code>/antiflood 5 10 60</code>: 5 сообщений за 10 секунд, мут на 60 минут. "
+    "Выключить: <code>/antiflood off</code>."
+)
+
+
+def describe_antiflood(config: ChatConfig) -> str:
+    if not config.antiflood:
+        return "выключен"
+    return (
+        f"{config.flood_messages} сообщений за {config.flood_window} с "
+        f"→ мут на {human_duration(config.flood_mute_minutes / 60)}"
+    )
 
 
 def human_duration(hours: float) -> str:
@@ -437,7 +455,7 @@ class TelegramAdapter:
             f"Полезные комментарии: {useful[chat['useful_mode'] if chat else 'digest']}\n"
             f"Ежедневная сводка: {on_off(not chat or bool(chat['digest']))}\n"
             f"Предупреждения о ссорах: {on_off(config.conflicts)}\n"
-            f"Антифлуд: {on_off(config.antiflood)}\n"
+            f"Антифлуд: {describe_antiflood(config)}\n"
             f"Аналитика комментариев: {on_off(config.analytics)}\n"
             f"Режим наблюдения (ничего не удаляю): {on_off(config.observe)}\n\n"
             f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам — всегда"
@@ -476,7 +494,32 @@ class TelegramAdapter:
         await self._switch(message, command, "observe", "Режим наблюдения")
 
     async def on_antiflood(self, message: Message, command: CommandObject) -> None:
-        await self._switch(message, command, "antiflood", "Антифлуд")
+        """/antiflood — show; /antiflood on|off; /antiflood 5 10 60 — 5 messages in 10 s → mute for 60 min."""
+        arg = await self.admin_args(message, command)
+        if arg is None:
+            return
+        chat_id = message.chat.id
+        if arg in ("on", "off"):
+            await self.storage.set_setting(chat_id, "antiflood", int(arg == "on"))
+        elif arg:
+            try:
+                messages, window, mute = (int(x) for x in arg.split())
+            except ValueError:
+                await message.reply(ANTIFLOOD_HELP)
+                return
+            for value, (low, high), title in (
+                (messages, FLOOD_LIMITS["messages"], "сообщений"),
+                (window, FLOOD_LIMITS["window"], "секунд"),
+                (mute, FLOOD_LIMITS["mute"], "минут мута"),
+            ):
+                if not low <= value <= high:
+                    await message.reply(f"Число {title} должно быть от {low} до {high}.\n\n{ANTIFLOOD_HELP}")
+                    return
+            await self.storage.set_setting(chat_id, "flood_messages", messages)
+            await self.storage.set_setting(chat_id, "flood_window", window)
+            await self.storage.set_setting(chat_id, "flood_mute", mute)
+            await self.storage.set_setting(chat_id, "antiflood", 1)
+        await message.reply(f"Антифлуд: {describe_antiflood(await self.config(chat_id))}\n\n{ANTIFLOOD_HELP}")
 
     async def on_analytics(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "analytics", "Аналитика комментариев")
@@ -599,15 +642,15 @@ class TelegramAdapter:
                 links.append(f"«{entity.extract_from(text)}» → профиль {entity.user.id}")
         return links[:10]
 
-    def flood_hit(self, chat_id: int, author_id: int) -> bool:
-        """Register a message; True when this author posted too many messages within a few seconds."""
+    def flood_hit(self, chat_id: int, author_id: int, limit: int = FLOOD_MESSAGES, window: int = FLOOD_WINDOW) -> bool:
+        """Register a message; True when this author posted `limit` messages within `window` seconds."""
         now = time.time()
-        stamps = self._flood.setdefault((chat_id, author_id), deque(maxlen=FLOOD_MESSAGES))
+        stamps = self._flood.setdefault((chat_id, author_id), deque(maxlen=FLOOD_LIMITS["messages"][1]))
         stamps.append(now)
         if len(self._flood) > 5000:
-            for key in [k for k, v in self._flood.items() if not v or now - v[-1] > FLOOD_WINDOW]:
+            for key in [k for k, v in self._flood.items() if not v or now - v[-1] > FLOOD_LIMITS["window"][1]]:
                 del self._flood[key]
-        return len(stamps) >= FLOOD_MESSAGES and now - stamps[0] <= FLOOD_WINDOW
+        return sum(1 for t in stamps if now - t <= window) >= limit
 
     async def on_group_message(self, message: Message) -> None:
         await self.handle_comment(message)
@@ -672,8 +715,12 @@ class TelegramAdapter:
             links=self.extract_links(message),
         )
 
-        if config.antiflood and not edited and self.flood_hit(chat_id, author_id):
-            decision = self.moderator.flood_decision()
+        if (
+            config.antiflood
+            and not edited
+            and self.flood_hit(chat_id, author_id, config.flood_messages, config.flood_window)
+        ):
+            decision = self.moderator.flood_decision(config.flood_mute_minutes)
         else:
             try:
                 decision = await self.moderator.check(comment, config, known)

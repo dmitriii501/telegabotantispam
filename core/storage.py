@@ -87,6 +87,9 @@ CHAT_COLUMNS = [
     ("antiflood", "INTEGER NOT NULL DEFAULT 1"),
     ("analytics", "INTEGER NOT NULL DEFAULT 1"),
     ("observe", "INTEGER NOT NULL DEFAULT 0"),
+    ("flood_messages", "INTEGER NOT NULL DEFAULT 6"),
+    ("flood_window", "INTEGER NOT NULL DEFAULT 20"),
+    ("flood_mute", "INTEGER NOT NULL DEFAULT 30"),
 ]
 LOG_COLUMNS = [
     ("executed", "INTEGER NOT NULL DEFAULT 1"),

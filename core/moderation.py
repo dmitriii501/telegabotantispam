@@ -85,6 +85,9 @@ class ChatConfig:
     antiflood: bool = True  # mute people who post many messages in seconds
     analytics: bool = True  # ask Jev for type, tone and leads of every comment
     observe: bool = False  # dry run: decide and log, but change nothing
+    flood_messages: int = 6  # this many messages ...
+    flood_window: int = 20  # ... within this many seconds trigger the antiflood mute
+    flood_mute_minutes: int = 30
 
     @property
     def prohibitions(self) -> list[Rule]:
@@ -116,6 +119,9 @@ class ChatConfig:
             antiflood=_column(row, "antiflood", 1) == 1,
             analytics=_column(row, "analytics", 1) == 1,
             observe=_column(row, "observe", 0) == 1,
+            flood_messages=int(_column(row, "flood_messages", 6)),
+            flood_window=int(_column(row, "flood_window", 20)),
+            flood_mute_minutes=int(_column(row, "flood_mute", 30)),
         )
 
 
