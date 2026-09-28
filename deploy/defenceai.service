@@ -1,0 +1,19 @@
+[Unit]
+Description=DefenceAi Telegram moderation bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=defenceai
+WorkingDirectory=/opt/defenceai
+ExecStart=/opt/defenceai/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+# Basic hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/defenceai
+
+[Install]
+WantedBy=multi-user.target
