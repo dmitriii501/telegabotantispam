@@ -49,6 +49,21 @@ CONFLICT_COOLDOWN = 60 * 60  # do not warn about the same thread twice in an hou
 THREAD_BUFFER = 30
 AUTO_REMEMBER_CONFIDENCE = 0.95  # bans this sure are remembered, so copies of the spam skip Jev
 
+# Antiflood: this many messages from one author within this many seconds.
+FLOOD_MESSAGES = 6
+FLOOD_WINDOW = 20
+JEV_ALERT_COOLDOWN = 60 * 60  # tell the owner about a Jev outage at most once an hour
+RIGHTS_ALERT_COOLDOWN = 6 * 60 * 60
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))  # comment texts are deleted after this long
+KIND_LABEL = {
+    "question": "вопросы",
+    "complaint": "жалобы",
+    "praise": "похвала",
+    "suggestion": "предложения",
+    "bug": "ошибки в постах",
+    "chat": "общение",
+}
+
 ACTION_LABEL = {
     "ban": "удалять и банить",
     "mute": "удалять и мутить на сутки",
@@ -60,7 +75,7 @@ ACTION_LABEL = {
 DECISION_LABEL = {
     ActionType.NONE: "оставил бы",
     ActionType.DELETE_AND_BAN: "удалил бы и забанил",
-    ActionType.DELETE_AND_MUTE: "удалил бы и замутил на сутки",
+    ActionType.DELETE_AND_MUTE: "удалил бы и замутил",
     ActionType.DELETE_SILENT: "удалил бы молча",
     ActionType.DELETE_AND_EXPLAIN: "удалил бы и объяснил автору",
     ActionType.SEND_TO_REVIEW: "прислал бы вам на проверку",
@@ -93,6 +108,9 @@ HELP_TEXT = (
     "/useful digest|instant|off — полезные комментарии: в сводку, сразу или никак\n"
     "/digest on|off — ежедневная сводка\n"
     "/conflicts on|off — предупреждать, когда обсуждение накаляется\n"
+    "/observe on|off — режим наблюдения: ничего не удалять, только записывать\n"
+    "/report — отчёт за 7 дней\n"
+    "/antiflood on|off — мут за флуд, /analytics on|off — типы и тон комментариев\n"
     "/check текст — что бы я сделал с таким комментарием\n"
     "/trust, /untrust — ответом на сообщение: не проверять этого человека\n"
     "/panel — веб-панель: правила, настройки, журнал\n"
@@ -132,6 +150,13 @@ def describe_rules(rules: list[Rule]) -> str:
     return "\n".join(describe_rule(r) for r in rules) or "правила не заданы"
 
 
+def human_duration(hours: float) -> str:
+    minutes = round(hours * 60)
+    if minutes < 60:
+        return f"{minutes} мин"
+    return f"{minutes // 60} ч" if minutes % 60 == 0 else f"{minutes // 60} ч {minutes % 60} мин"
+
+
 def on_off(value: bool) -> str:
     return "включено" if value else "выключено"
 
@@ -146,6 +171,11 @@ class TelegramAdapter:
         self._threads: dict[tuple[int, int], deque] = {}
         self._checked: dict[tuple[int, int], float] = {}
         self._alerted: dict[tuple[int, int], float] = {}
+        self._flood: dict[tuple[int, int], deque] = {}
+        self._notified: dict[tuple[int, str], float] = {}
+        self._linked: dict[int, int | None] = {}
+        self._tasks: set[asyncio.Task] = set()  # strong references: a bare create_task can be garbage collected
+        self._purged_day = ""
         self.webapp_url = os.getenv("WEBAPP_URL", "").rstrip("/")
         self.router = Router()
         self._register()
@@ -183,6 +213,33 @@ class TelegramAdapter:
         except TelegramAPIError as e:
             log.info("Cannot DM %s: %s", user_id, e)
             return False
+
+    def spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def notify_owner(self, chat, key: str, text: str, cooldown: float) -> None:
+        """Message the chat owner, but not more often than once per `cooldown` for the same `key`."""
+        owner_id = chat["owner_id"] if chat else None
+        if not owner_id:
+            return
+        ck = (chat["chat_id"], key)
+        now = time.time()
+        if now - self._notified.get(ck, 0) < cooldown:
+            return
+        self._notified[ck] = now
+        await self.dm(owner_id, text)
+
+    async def linked_channel(self, chat_id: int) -> int | None:
+        """The channel this discussion group belongs to (its own comments are never moderated)."""
+        if chat_id not in self._linked:
+            try:
+                self._linked[chat_id] = (await self.bot.get_chat(chat_id)).linked_chat_id
+            except TelegramAPIError:
+                return None
+        return self._linked[chat_id]
 
     async def delete_later(self, chat_id: int, message_id: int, delay: int) -> None:
         await asyncio.sleep(delay)
@@ -254,6 +311,10 @@ class TelegramAdapter:
         r.message(Command("check"), GROUPS)(self.on_check)
         r.message(Command("trust", "untrust"), GROUPS)(self.on_trust)
         r.message(Command("conflicts"), GROUPS)(self.on_conflicts)
+        r.message(Command("observe"), GROUPS)(self.on_observe)
+        r.message(Command("antiflood"), GROUPS)(self.on_antiflood)
+        r.message(Command("analytics"), GROUPS)(self.on_analytics)
+        r.message(Command("report"), GROUPS)(self.on_report)
         r.message(Command("panel"))(self.on_panel)
         r.message(Command("off", "on"), GROUPS)(self.on_toggle)
         r.callback_query(F.data.startswith("rules:"))(self.on_rules_button)
@@ -261,6 +322,7 @@ class TelegramAdapter:
         r.callback_query(F.data.startswith("ap:"))(self.on_appeal_decision)
         r.callback_query(F.data.startswith("rev:"))(self.on_review_decision)
         r.message(GROUPS)(self.on_group_message)
+        r.edited_message(GROUPS)(self.on_edited_message)
 
     async def on_start(self, message: Message) -> None:
         await message.answer(HELP_TEXT, reply_markup=self.panel_markup())
@@ -284,14 +346,23 @@ class TelegramAdapter:
             return
         if event.new_chat_member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR):
             return
-        await self.storage.ensure_chat(event.chat.id)
+        created = await self.storage.ensure_chat(event.chat.id)
+        if created:
+            await self.storage.set_setting(event.chat.id, "observe", 1)
         missing = await self.check_rights(event.chat.id)
         if missing:
             text = "Привет! Чтобы модерировать, мне нужны права админа: " + ", ".join(missing) + "."
+        elif created:
+            text = (
+                "Готов к работе. Первые дни я в <b>режиме наблюдения</b>: ничего не удаляю, а записываю, "
+                "что сделал бы. Через несколько дней <code>/report</code> покажет результат, "
+                "<code>/observe off</code> включит настоящую модерацию.\n"
+                "Задайте правила обычным языком: <code>/rules мат можно, рекламу нельзя — бан</code>"
+            )
         else:
             text = (
-                "Готов к работе. Спам удаляю уже сейчас.\n"
-                "Задайте правила обычным языком: <code>/rules мат можно, рекламу нельзя — бан</code>"
+                "Готов к работе. Задайте правила обычным языком: "
+                "<code>/rules мат можно, рекламу нельзя — бан</code>"
             )
         try:
             await self.bot.send_message(event.chat.id, text)
@@ -365,7 +436,10 @@ class TelegramAdapter:
             f"Мут и бан за повторные нарушения: {on_off(config.escalation)}\n"
             f"Полезные комментарии: {useful[chat['useful_mode'] if chat else 'digest']}\n"
             f"Ежедневная сводка: {on_off(not chat or bool(chat['digest']))}\n"
-            f"Предупреждения о ссорах: {on_off(config.conflicts)}\n\n"
+            f"Предупреждения о ссорах: {on_off(config.conflicts)}\n"
+            f"Антифлуд: {on_off(config.antiflood)}\n"
+            f"Аналитика комментариев: {on_off(config.analytics)}\n"
+            f"Режим наблюдения (ничего не удаляю): {on_off(config.observe)}\n\n"
             f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам — всегда"
         )
 
@@ -397,6 +471,22 @@ class TelegramAdapter:
 
     async def on_conflicts(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "conflicts", "Предупреждения о ссорах")
+
+    async def on_observe(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "observe", "Режим наблюдения")
+
+    async def on_antiflood(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "antiflood", "Антифлуд")
+
+    async def on_analytics(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "analytics", "Аналитика комментариев")
+
+    async def on_report(self, message: Message) -> None:
+        if not await self.is_admin_message(message):
+            return
+        config = await self.config(message.chat.id)
+        text = await self.build_digest(message.chat.id, int(time.time()) - 7 * DAY, config.observe, "за 7 дней")
+        await message.reply(text or "За неделю пока нечего показать: бот ещё ничего не проверял.")
 
     async def on_digest(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "digest", "Ежедневная сводка")
@@ -495,24 +585,70 @@ class TelegramAdapter:
                 reply_to = parent_text
         return post, reply_to
 
+    @staticmethod
+    def extract_links(message: Message) -> list[str]:
+        """Links Jev cannot see in the plain text: hidden behind a word, or written as a url."""
+        text = message.text or message.caption or ""
+        links = []
+        for entity in message.entities or message.caption_entities or []:
+            if entity.type == "text_link" and entity.url:
+                links.append(f"«{entity.extract_from(text)}» → {entity.url}")
+            elif entity.type == "url":
+                links.append(entity.extract_from(text))
+            elif entity.type == "text_mention" and entity.user:
+                links.append(f"«{entity.extract_from(text)}» → профиль {entity.user.id}")
+        return links[:10]
+
+    def flood_hit(self, chat_id: int, author_id: int) -> bool:
+        """Register a message; True when this author posted too many messages within a few seconds."""
+        now = time.time()
+        stamps = self._flood.setdefault((chat_id, author_id), deque(maxlen=FLOOD_MESSAGES))
+        stamps.append(now)
+        if len(self._flood) > 5000:
+            for key in [k for k, v in self._flood.items() if not v or now - v[-1] > FLOOD_WINDOW]:
+                del self._flood[key]
+        return len(stamps) >= FLOOD_MESSAGES and now - stamps[0] <= FLOOD_WINDOW
+
     async def on_group_message(self, message: Message) -> None:
+        await self.handle_comment(message)
+
+    async def on_edited_message(self, message: Message) -> None:
+        # A classic trick: post something harmless, then edit it into an advert.
+        await self.handle_comment(message, edited=True)
+
+    async def handle_comment(self, message: Message, edited: bool = False) -> None:
         if message.is_automatic_forward:
-            await self.remember_post(message)
+            if not edited:
+                await self.remember_post(message)
             return
         text = message.text or message.caption
-        if not text or not message.from_user:
+        if not text:
             return
-        if message.sender_chat or message.from_user.is_bot:
-            return  # channel posts, anonymous admins, other bots
         chat_id = message.chat.id
         chat = await self.storage.get_chat(chat_id)
         if chat and not chat["enabled"]:
             return
-        user = message.from_user
-        if await self.is_admin(chat_id, user.id) or await self.storage.is_trusted(chat_id, user.id):
+
+        sender, user = message.sender_chat, message.from_user
+        if sender:
+            # Posted on behalf of a channel. Anonymous admins (the group itself) and the group's own
+            # channel are fine; any other channel is a stranger and is moderated like a person.
+            if sender.id == chat_id:
+                await self.note_admin_reply(message, edited)
+                return
+            if sender.id == await self.linked_channel(chat_id):
+                return
+            author_id, author_name, username, premium = sender.id, sender.title or "Канал", sender.username, False
+        elif user and not user.is_bot:
+            if await self.is_admin(chat_id, user.id):
+                await self.note_admin_reply(message, edited)
+                return
+            author_id, author_name, username, premium = user.id, user.full_name, user.username, bool(user.is_premium)
+        else:
+            return  # other bots
+        if await self.storage.is_trusted(chat_id, author_id):
             return
 
-        messages, deletions = await self.storage.user_counters(chat_id, user.id)
         config = ChatConfig.from_row(chat)
         key = example_key(text)
         known = await self.storage.example_kind(chat_id, key) if key else None
@@ -524,34 +660,46 @@ class TelegramAdapter:
             message_id=message.message_id,
             text=text,
             author=Author(
-                user_id=user.id,
-                display_name=user.full_name,
-                username=user.username,
-                is_premium=bool(user.is_premium),
-                previous_messages=messages,
-                previous_deletions=deletions,
+                user_id=author_id,
+                display_name=author_name,
+                username=username,
+                is_premium=premium,
+                previous_messages=await self.storage.message_count(chat_id, author_id),
+                previous_deletions=await self.storage.recent_deletions(chat_id, author_id),
             ),
             post_text=post_text,
             reply_to_text=reply_to_text,
+            links=self.extract_links(message),
         )
-        try:
-            decision = await self.moderator.check(comment, config, known)
-        except JevError as e:
-            log.error("Moderation failed, letting the comment through: %s", e)
-            return
 
-        deleted = decision.action in DELETING_ACTIONS
-        await self.storage.count_message(chat_id, user.id, deleted)
-        if not deleted:
-            asyncio.create_task(self.watch_thread(message, text, config, chat))
-        if decision.verdict is None:
-            return  # skipped without calling Jev
+        if config.antiflood and not edited and self.flood_hit(chat_id, author_id):
+            decision = self.moderator.flood_decision()
+        else:
+            try:
+                decision = await self.moderator.check(comment, config, known)
+            except JevError as e:
+                log.error("Jev unavailable, using the local fallback filter: %s", e)
+                await self.notify_owner(
+                    chat,
+                    "jev_down",
+                    "⚠️ ИИ сейчас недоступен. Пока он не вернётся, работает упрощённая защита: "
+                    "только заведомый спам со ссылками. Остальные комментарии проходят без проверки.",
+                    JEV_ALERT_COOLDOWN,
+                )
+                decision = self.moderator.fallback(comment, config)
+
+        if not edited:
+            await self.storage.count_message(chat_id, author_id)
+            if decision.action not in DELETING_ACTIONS:
+                self.spawn(self.watch_thread(message, text, config, chat))
         v = decision.verdict
+        if v is None:
+            return  # nothing to record: skipped without asking Jev
         log_id = await self.storage.add_log(
             chat_id=chat_id,
             message_id=message.message_id,
-            user_id=user.id,
-            user_name=user.full_name,
+            user_id=author_id,
+            user_name=author_name,
             text=text,
             category=v.category.value,
             confidence=v.confidence,
@@ -559,11 +707,26 @@ class TelegramAdapter:
             action=decision.action.value,
             reason=decision.reason,
             tokens=v.input_tokens,
+            kind=v.kind,
+            lead=v.lead,
+            needs_answer=v.needs_answer,
+            sentiment=v.sentiment,
+            violation=v.violation_probability,
         )
-        log.info("chat=%s user=%s action=%s %s", chat_id, user.id, decision.action.value, v)
+        log.info("chat=%s author=%s action=%s edited=%s %s", chat_id, author_id, decision.action.value, edited, v)
+        if config.observe:
+            await self.storage.set_executed(log_id, False)  # a dry run: recorded, not carried out
+            return
         if key and decision.action == ActionType.DELETE_AND_BAN and v.confidence >= AUTO_REMEMBER_CONFIDENCE:
             await self.storage.add_example(chat_id, key, "remove")
-        await self.execute(message, decision, log_id, chat)
+        if not await self.execute(message, decision, log_id, chat):
+            await self.storage.set_executed(log_id, False)
+
+    async def note_admin_reply(self, message: Message, edited: bool) -> None:
+        """An admin answered a comment: it stops counting as unanswered."""
+        parent = message.reply_to_message
+        if parent and not edited:
+            await self.storage.mark_answered(message.chat.id, parent.message_id)
 
     # ---------------------------------------------------------- conflict alerts
 
@@ -620,18 +783,24 @@ class TelegramAdapter:
         except Exception:  # background task: never let it crash the handler
             log.exception("Conflict check failed")
 
-    async def execute(self, message: Message, decision: Decision, log_id: int, chat) -> None:
+    async def execute(self, message: Message, decision: Decision, log_id: int, chat) -> bool:
+        """Carry the decision out. Returns False when Telegram refused (usually missing admin rights)."""
         action = decision.action
         owner_id = chat["owner_id"] if chat else None
         useful_mode = chat["useful_mode"] if chat else "digest"
-        user = message.from_user
+        sender, user = message.sender_chat, message.from_user
+        name = sender.title if sender else user.full_name
         shown = message.text or message.caption
         try:
             if action in DELETING_ACTIONS:
                 await message.delete()
-            if action == ActionType.DELETE_AND_BAN:
-                await self.bot.ban_chat_member(message.chat.id, user.id)
-            elif action in (ActionType.DELETE_AND_EXPLAIN, ActionType.DELETE_AND_MUTE):
+            # A channel cannot be warned or muted, so any removal of its comment bans the channel.
+            if action == ActionType.DELETE_AND_BAN or (sender and action in DELETING_ACTIONS):
+                if sender:
+                    await self.bot.ban_chat_sender_chat(message.chat.id, sender.id)
+                else:
+                    await self.bot.ban_chat_member(message.chat.id, user.id)
+            elif action in (ActionType.DELETE_AND_EXPLAIN, ActionType.DELETE_AND_MUTE) and not sender:
                 hours = decision.extra.get("mute_hours")
                 if hours:
                     await self.bot.restrict_chat_member(
@@ -641,19 +810,19 @@ class TelegramAdapter:
                         until_date=timedelta(hours=hours),
                     )
                 mention = f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
-                tail = f" Писать в чате можно будет через {hours} ч." if hours else ""
+                tail = f" Писать в чате можно будет через {human_duration(hours)}." if hours else ""
                 notice = await self.bot.send_message(
                     message.chat.id,
                     f"{mention}, ваш комментарий удалён: {html.escape(decision.reason)}.{tail}",
                     reply_to_message_id=message.reply_to_message.message_id if message.reply_to_message else None,
                     reply_markup=kb([("Не согласен — оспорить", f"appeal:{log_id}")]),
                 )
-                asyncio.create_task(self.delete_later(message.chat.id, notice.message_id, EXPLANATION_TTL))
+                self.spawn(self.delete_later(message.chat.id, notice.message_id, EXPLANATION_TTL))
             elif action == ActionType.SEND_TO_REVIEW:
                 v = decision.verdict
                 await self.dm(
                     owner_id,
-                    f"🤔 Комментарий от {html.escape(user.full_name)} "
+                    f"🤔 Комментарий от {html.escape(name)} "
                     f"({html.escape(decision.reason)}, уверенность {v.confidence:.0%}):\n"
                     f"{quote(shown)}\n{chat_message_link(message.chat.id, message.message_id, message.chat.username)}",
                     kb([("🗑 Удалить", f"rev:del:{log_id}"), ("✅ Оставить", f"rev:keep:{log_id}")]),
@@ -661,11 +830,21 @@ class TelegramAdapter:
             elif action == ActionType.FORWARD_USEFUL and useful_mode == "instant":
                 await self.dm(
                     owner_id,
-                    f"💡 Полезный комментарий от {html.escape(user.full_name)}:\n"
+                    f"💡 Полезный комментарий от {html.escape(name)}:\n"
                     f"{quote(shown)}\n{chat_message_link(message.chat.id, message.message_id, message.chat.username)}",
                 )
+            return True
         except TelegramAPIError as e:
             log.warning("Action %s failed in chat %s: %s", action.value, message.chat.id, e)
+            if any(word in str(e).lower() for word in ("rights", "admin", "forbidden", "kicked")):
+                await self.notify_owner(
+                    chat,
+                    "rights",
+                    "⚠️ Мне не хватает прав в чате: не могу удалять сообщения или банить. "
+                    "Сделайте меня админом с правами «Удалять сообщения» и «Блокировать пользователей».",
+                    RIGHTS_ALERT_COOLDOWN,
+                )
+            return False
 
     # ------------------------------------------------------------------ appeals
 
@@ -731,7 +910,6 @@ class TelegramAdapter:
         """The admin says the deletion was wrong: repost the text and undo the penalties."""
         chat_id, user_id = entry["chat_id"], entry["user_id"]
         await self.storage.set_feedback(entry["id"], "not_spam")
-        await self.storage.reset_deletions(chat_id, user_id)
         if entry["action"] == ActionType.DELETE_AND_MUTE.value:
             await self._lift_restrictions(chat_id, user_id)
         elif entry["action"] == ActionType.DELETE_AND_BAN.value:
@@ -756,7 +934,6 @@ class TelegramAdapter:
         await self.storage.set_feedback(entry["id"], "confirmed")
         try:
             await self.bot.delete_message(entry["chat_id"], entry["message_id"])
-            await self.storage.count_message(entry["chat_id"], entry["user_id"], deleted=True)
             return "🗑 Удалено."
         except TelegramAPIError:
             return "Не удалось удалить: сообщение уже удалено или прошло больше 48 часов."
@@ -783,28 +960,55 @@ class TelegramAdapter:
 
     # ------------------------------------------------------------------- digest
 
-    async def build_digest(self, chat_id: int, since: int) -> str | None:
+    async def build_digest(
+        self, chat_id: int, since: int, observe: bool = False, period: str = "за сутки"
+    ) -> str | None:
         s = await self.storage.stats(chat_id, since)
         checked = sum(v for k, v in s.items() if k != "tokens")
         if not checked:
             return None
         deleted = sum(s.get(a.value, 0) for a in DELETING_ACTIONS)
+        bans = s.get(ActionType.DELETE_AND_BAN.value, 0)
         try:
             title = html.escape((await self.bot.get_chat(chat_id)).title or "")
         except TelegramAPIError:
             title = ""
-        lines = [
-            f"📊 <b>Сводка за сутки</b> {title}".rstrip(),
-            f"Проверено комментариев: {checked}",
-            f"Удалено: {deleted}, из них с баном: {s.get(ActionType.DELETE_AND_BAN.value, 0)}",
-        ]
+        if observe:
+            lines = [
+                f"🔎 <b>Отчёт режима наблюдения {period}</b> {title}".rstrip(),
+                "Ничего не удалялось: бот записывал, что сделал бы.",
+                f"Проверено комментариев: {checked}",
+                f"Удалил бы: {deleted}, из них забанил бы: {bans}",
+            ]
+        else:
+            lines = [
+                f"📊 <b>Сводка {period}</b> {title}".rstrip(),
+                f"Проверено комментариев: {checked}",
+                f"Удалено: {deleted}, из них с баном: {bans}",
+            ]
         review = s.get(ActionType.SEND_TO_REVIEW.value, 0)
         if review:
-            lines.append(f"Отправлено вам на проверку: {review}")
+            lines.append(f"Спорных, отправленных вам на проверку: {review}")
         reasons = await self.storage.top_reasons(chat_id, since)
         if reasons:
-            lines.append("\n<b>Чаще всего удалял:</b>")
+            lines.append("\n<b>Чаще всего удалял:</b>" if not observe else "\n<b>Чаще всего удалил бы:</b>")
             lines += [f"• {html.escape(reason)} — {n}" for reason, n in reasons]
+
+        kinds = await self.storage.kind_counts(chat_id, since)
+        if kinds:
+            parts = [f"{KIND_LABEL.get(k, k)} {n}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])]
+            lines.append("\n<b>О чём пишут:</b> " + ", ".join(parts))
+        mood = await self.storage.sentiment_summary(chat_id, since)
+        if mood["n"] >= 5:
+            lines.append(f"Тон: негативных {mood['negative']}, позитивных {mood['positive']} из {mood['n']}")
+        waiting = await self.storage.unanswered(chat_id, since, limit=5)
+        if waiting:
+            lines.append("\n📨 <b>Ждут ответа:</b>")
+            for row in waiting:
+                snippet = row["text"] if len(row["text"]) <= 160 else row["text"][:160] + "…"
+                mark = "🛒 " if (row["lead"] or 0) >= 0.6 else ""
+                link = chat_message_link(chat_id, row["message_id"])
+                lines.append(f"• {mark}{html.escape(row['user_name'] or '')}: {html.escape(snippet)}\n{link}")
         useful = await self.storage.useful_comments(chat_id, since)
         if useful:
             lines.append("\n💡 <b>Полезные комментарии:</b>")
@@ -821,15 +1025,30 @@ class TelegramAdapter:
             if chat["digest_last"] == today:
                 continue
             try:
-                text = await self.build_digest(chat["chat_id"], int(now.timestamp()) - DAY)
+                text = await self.build_digest(
+                    chat["chat_id"], int(now.timestamp()) - DAY, bool(chat["observe"])
+                )
                 if text:
                     await self.dm(chat["owner_id"], text)
             except Exception:  # one broken chat must not stop the others
                 log.exception("Digest failed for chat %s", chat["chat_id"])
             await self.storage.mark_digest_sent(chat["chat_id"], today)
 
+    async def purge_expired(self, today: str) -> None:
+        """Once a day: comment texts and names older than RETENTION_DAYS are deleted."""
+        if self._purged_day == today:
+            return
+        self._purged_day = today
+        removed = await self.storage.purge_old(RETENTION_DAYS)
+        log.info("Retention: removed %d log rows older than %d days", removed, RETENTION_DAYS)
+
     async def digest_loop(self) -> None:
         while True:
             await asyncio.sleep(60)
-            if datetime.now(timezone.utc).hour == DIGEST_HOUR_UTC:
-                await self.send_digests()
+            now = datetime.now(timezone.utc)
+            if now.hour == DIGEST_HOUR_UTC:
+                try:
+                    await self.send_digests(now)
+                    await self.purge_expired(now.strftime("%Y-%m-%d"))
+                except Exception:
+                    log.exception("Daily job failed")

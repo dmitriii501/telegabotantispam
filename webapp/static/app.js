@@ -26,6 +26,14 @@ const MODE_HINT = {
   normal: "Сомнительные комментарии бот присылает вам.",
   strict: "Бот удаляет даже при небольшой уверенности.",
 };
+const KIND_LABEL = {
+  question: "Вопросы",
+  complaint: "Жалобы",
+  praise: "Похвала",
+  suggestion: "Предложения",
+  bug: "Ошибки в постах",
+  chat: "Общение",
+};
 const ACTION_PILL = {
   delete_and_ban: ["бан", "bad"],
   delete_and_mute: ["мут", "bad"],
@@ -101,11 +109,11 @@ function renderApp() {
     <header>
       <h1>${esc(chatTitle())}</h1>
       <div class="sub"><span class="dot ${s.enabled ? "" : "off"}"></span>
-        ${s.enabled ? "Модерация включена" : "Модерация выключена"}
+        ${!s.enabled ? "Модерация выключена" : s.observe ? "Режим наблюдения: ничего не удаляю" : "Модерация включена"}
         ${state.chats.length > 1 ? '<span>·</span><button class="link" id="switch">сменить чат</button>' : ""}</div>
     </header>
     <nav id="tabs">
-      ${[["rules", "Правила"], ["settings", "Настройки"], ["log", "Журнал"]]
+      ${[["rules", "Правила"], ["insights", "Аналитика"], ["settings", "Настройки"], ["log", "Журнал"]]
         .map(([id, name]) => `<button data-t="${id}" class="${state.tab === id ? "on" : ""}">${name}</button>`)
         .join("")}
     </nav>
@@ -129,6 +137,7 @@ function renderTab() {
   view.onchange = null;
   if (state.tab === "rules") renderRules();
   else if (state.tab === "settings") renderSettings();
+  else if (state.tab === "insights") renderInsights();
   else renderLog();
 }
 
@@ -285,6 +294,9 @@ function renderSettings() {
     <div class="h">Поведение</div>
     <div class="card">
       ${toggle("enabled", "Модерация", "Выключите, чтобы бот временно ничего не проверял")}
+      ${toggle("observe", "Режим наблюдения", "Бот ничего не удаляет, только записывает, что сделал бы. Итог в /report")}
+      ${toggle("antiflood", "Антифлуд", "Мут на 30 минут за 6 сообщений подряд за 20 секунд")}
+      ${toggle("analytics", "Аналитика комментариев", "Тип, тон и «ждёт ответа» для каждого комментария")}
       ${toggle("lockdown", "Режим тишины", "Удалять все сообщения не-админов")}
       ${toggle("escalation", "Мут и бан за повторы", "3-е нарушение — мут на сутки, 5-е — бан")}
       ${toggle("conflicts", "Предупреждать о ссорах", "Сообщу вам, если обсуждение накаляется")}
@@ -316,6 +328,59 @@ async function untrust(userId) {
   }
 }
 
+// -------------------------------------------------------------------- insights
+
+function messageLink(messageId) {
+  return `https://t.me/c/${String(state.chatId).replace("-100", "")}/${messageId}`;
+}
+
+async function renderInsights() {
+  $("#view").innerHTML = '<p class="empty">Загрузка…</p>';
+  let data;
+  try {
+    data = await api("GET", `/chat/${state.chatId}/insights?days=7`);
+  } catch (e) {
+    $("#view").innerHTML = `<p class="empty">${esc(e.message)}</p>`;
+    return;
+  }
+  if (!data.analytics) {
+    $("#view").innerHTML = '<p class="empty">Аналитика выключена. Включите её в настройках, и бот начнёт размечать комментарии.</p>';
+    return;
+  }
+  const kinds = Object.entries(data.kinds).sort((a, b) => b[1] - a[1]);
+  const max = Math.max(1, ...kinds.map((k) => k[1]));
+  const bars = kinds
+    .map(
+      ([k, n]) => `<div class="bar"><span>${esc(KIND_LABEL[k] || k)}</span>
+        <div class="track"><div class="fill" style="width:${Math.round((n / max) * 100)}%"></div></div><b>${n}</b></div>`
+    )
+    .join("");
+  const mood = data.mood;
+  const moodLine = mood.n >= 5
+    ? `<div class="tag" style="margin-top:8px">Тон: негативных ${mood.negative}, позитивных ${mood.positive} из ${mood.n}</div>`
+    : "";
+  const waiting = data.waiting
+    .map(
+      (w) => `<div class="card entry">
+        <div class="who"><span>${esc(w.user_name || "Без имени")}</span>
+          <span class="pill ${w.lead >= 0.6 ? "good" : "warn"}">${w.lead >= 0.6 ? "🛒 хочет купить" : "ждёт ответа"}</span></div>
+        <blockquote>${esc(w.text)}</blockquote>
+        <div class="acts"><button class="btn ghost" data-open="${esc(messageLink(w.message_id))}">Открыть в чате</button></div></div>`
+    )
+    .join("");
+  $("#view").innerHTML = `
+    <div class="h">О чём пишут за неделю</div>
+    <div class="card">${bars || '<div class="tag">Пока нет данных: бот размечает комментарии по мере проверки.</div>'}${moodLine}</div>
+    <div class="h">Ждут вашего ответа</div>
+    ${waiting || '<p class="empty">Всё разобрано: вопросов без ответа нет.</p>'}`;
+  $("#view").onclick = (e) => {
+    const url = e.target.dataset.open;
+    if (!url) return;
+    if (tg.openTelegramLink) tg.openTelegramLink(url);
+    else window.open(url, "_blank");
+  };
+}
+
 // -------------------------------------------------------------------------- log
 
 async function renderLog() {
@@ -335,8 +400,11 @@ function entryCard(e) {
   const conf = e.confidence == null ? "" : ` · ${Math.round(e.confidence * 100)}%`;
   let acts = "";
   let status = "";
-  if (e.feedback === "not_spam") status = '<span class="pill good">решено: оставлено</span>';
+  const dryRun = e.executed === false && e.action !== "send_to_review";
+  if (dryRun) status = '<span class="pill">наблюдение: не удалено</span>';
+  else if (e.feedback === "not_spam") status = '<span class="pill good">решено: оставлено</span>';
   else if (e.feedback === "confirmed") status = '<span class="pill">решено: удалено</span>';
+  else if (dryRun) acts = "";
   else if (e.action === "send_to_review")
     acts = `<div class="acts"><button class="btn primary" data-review="${e.id}" data-del="1">🗑 Удалить</button>
       <button class="btn ghost" data-review="${e.id}" data-del="0">✅ Оставить</button></div>`;

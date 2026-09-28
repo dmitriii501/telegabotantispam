@@ -34,7 +34,7 @@ async def main() -> None:
         await adapter.set_menu_button()
     try:
         await adapter.dispatcher().start_polling(
-            bot, allowed_updates=["message", "callback_query", "my_chat_member"]
+            bot, allowed_updates=["message", "edited_message", "callback_query", "my_chat_member"]
         )
     finally:
         digest_task.cancel()

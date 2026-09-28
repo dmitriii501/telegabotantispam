@@ -53,14 +53,13 @@ async def test_old_database_is_migrated(tmp_path):
     await s.close()
 
 
-async def test_user_counters_and_trust(storage):
-    await storage.count_message(1, 5, deleted=True)
-    await storage.count_message(1, 5, deleted=False)
-    assert await storage.user_counters(1, 5) == (2, 1)
-    await storage.reset_deletions(1, 5)
-    assert await storage.user_counters(1, 5) == (2, 0)
+async def test_message_counter_and_trust(storage):
+    assert await storage.message_count(1, 5) == 0
+    await storage.count_message(1, 5)
+    await storage.count_message(1, 5)
+    assert await storage.message_count(1, 5) == 2
     assert not await storage.is_trusted(1, 5)
-    await storage.set_trusted(1, 5, True)
+    await storage.set_trusted(1, 5, True, "Вася")
     assert await storage.is_trusted(1, 5)
     await storage.set_trusted(1, 5, False)
     assert not await storage.is_trusted(1, 5)

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 from core.jev_client import JevClient
 from core.models import ActionType, Category, Comment, Decision, Verdict
+from core.fallback import looks_like_spam
 from core.normalizer import normalize
 from core.rules import (
     BASE_RULE,
@@ -47,6 +48,8 @@ ACTION_MAP = {
 # Comments without letters or links (emoji, "+", "!!!") are never sent to Jev.
 MIN_LETTERS = 2
 
+FLOOD_MUTE_MINUTES = 30
+
 # Repeat offenders: the Nth deleted comment in a chat escalates the action.
 MUTE_AT = 3
 BAN_AT = 5
@@ -62,12 +65,13 @@ class Thresholds:
     ban_bot_probability: float = 0.7
     silent_bot_probability: float = 0.3  # above this the author is not clearly human
     useful_confidence: float = 0.7
+    suspect: float = 0.4  # "normal" comments this likely to break a rule go to the admin
 
 
 MODES = {
-    "soft": Thresholds(review_below=0.85, ban_confidence=0.95, ban_bot_probability=0.8),
+    "soft": Thresholds(review_below=0.85, ban_confidence=0.95, ban_bot_probability=0.8, suspect=0.5),
     "normal": Thresholds(),
-    "strict": Thresholds(review_below=0.55, ban_confidence=0.85, ban_bot_probability=0.6),
+    "strict": Thresholds(review_below=0.55, ban_confidence=0.85, ban_bot_probability=0.6, suspect=0.3),
 }
 
 
@@ -78,6 +82,9 @@ class ChatConfig:
     lockdown: bool = False  # delete everything from non-admins
     escalation: bool = True
     conflicts: bool = True  # warn the owner when a discussion heats up
+    antiflood: bool = True  # mute people who post many messages in seconds
+    analytics: bool = True  # ask Jev for type, tone and leads of every comment
+    observe: bool = False  # dry run: decide and log, but change nothing
 
     @property
     def prohibitions(self) -> list[Rule]:
@@ -106,6 +113,9 @@ class ChatConfig:
             lockdown=bool(row["lockdown"]),
             escalation=bool(row["escalation"]),
             conflicts=_column(row, "conflicts", 1) == 1,
+            antiflood=_column(row, "antiflood", 1) == 1,
+            analytics=_column(row, "analytics", 1) == 1,
+            observe=_column(row, "observe", 0) == 1,
         )
 
 
@@ -130,9 +140,9 @@ def _column(row: Mapping, name: str, default):
     return default if value is None else value
 
 
-def needs_check(text: str) -> bool:
+def needs_check(text: str, links: list[str] | None = None) -> bool:
     letters = sum(ch.isalpha() for ch in text)
-    return letters >= MIN_LETTERS or "http" in text or "t.me" in text or "@" in text
+    return letters >= MIN_LETTERS or bool(links) or "http" in text or "t.me" in text or "@" in text
 
 
 def _clip(text: str | None) -> str | None:
@@ -156,6 +166,8 @@ def build_state(comment: Comment, rules: list[Rule]) -> dict:
     state = {"rules": texts, "comment": comment.text, "author": author}
     if normalized != comment.text:
         state["comment_with_letters_restored"] = normalized
+    if comment.links:
+        state["links_in_the_message"] = comment.links[:10]
     if comment.post_text:
         state["post_the_comment_is_under"] = _clip(comment.post_text)
     if comment.reply_to_text:
@@ -163,10 +175,40 @@ def build_state(comment: Comment, rules: list[Rule]) -> dict:
     return state
 
 
-def build_questions(prohibitions: list[Rule]) -> dict:
+KIND_CRITERIA = {
+    "question": "Спрашивает о чём-то по делу и ждёт ответа",
+    "complaint": "Жалуется, выражает недовольство или претензию",
+    "praise": "Хвалит, благодарит, выражает одобрение",
+    "suggestion": "Предлагает идею, улучшение или тему для будущих постов",
+    "bug": "Указывает на ошибку, неточность или опечатку в посте или продукте",
+    "chat": "Обычное общение, эмоции, реакция, шутка, спор с другими",
+}
+ANALYTICS_QUESTIONS = {
+    "kind": {
+        "type": "choice",
+        "instructions": "Какого типа `comment`?",
+        "criteria": KIND_CRITERIA,
+    },
+    "lead": {
+        "type": "noul",
+        "instructions": "Автор `comment` хочет купить, узнать цену или условия, записаться или просит связаться с ним?",
+    },
+    "needs_answer": {
+        "type": "noul",
+        "instructions": "Автор `comment` ждёт ответа от владельца канала?",
+    },
+    "sentiment": {
+        "type": "score",
+        "instructions": "Какое отношение к посту или автору канала выражает `comment`?",
+        "criteria": ["Негативное", "Нейтральное", "Позитивное"],
+    },
+}
+
+
+def build_questions(prohibitions: list[Rule], analytics: bool = False) -> dict:
     rule_options = {f"r{i}": rule.text for i, rule in enumerate(prohibitions)}
     rule_options["none"] = "Комментарий не нарушает ни одно правило"
-    return {
+    questions = {
         "category": {
             "type": "choice",
             "instructions": "К какой категории относится `comment` с учётом `rules`?",
@@ -186,17 +228,33 @@ def build_questions(prohibitions: list[Rule]) -> dict:
             },
         },
     }
+    if analytics:
+        questions.update(ANALYTICS_QUESTIONS)
+    return questions
 
 
 def parse_verdict(response: dict) -> Verdict:
     answers = response["answers"]
+    category = answers["category"]
     rule_choice = answers["rule"]["choice"]
+    chosen = Category(category["choice"])
+    probabilities = category.get("probabilities") or {}
+    if probabilities:
+        violation = probabilities.get(Category.SPAM.value, 0.0) + probabilities.get(Category.RULE_VIOLATION.value, 0.0)
+    else:
+        violation = float(category["confidence"]) if chosen in (Category.SPAM, Category.RULE_VIOLATION) else 0.0
+    kind = answers.get("kind", {}).get("choice")
     return Verdict(
-        category=Category(answers["category"]["choice"]),
-        confidence=float(answers["category"]["confidence"]),
+        category=chosen,
+        confidence=float(category["confidence"]),
         bot_probability=float(answers["is_bot"]["noul"]),
         rule_index=None if rule_choice == "none" else int(rule_choice[1:]),
         input_tokens=int(response.get("usage", {}).get("input_tokens", 0)),
+        violation_probability=min(float(violation), 1.0),
+        kind=kind if kind in KIND_CRITERIA else None,
+        lead=float(answers.get("lead", {}).get("noul", 0.0)),
+        needs_answer=float(answers.get("needs_answer", {}).get("noul", 0.0)),
+        sentiment=float(answers["sentiment"]["score"]) if "sentiment" in answers else None,
     )
 
 
@@ -250,6 +308,9 @@ def decide(
         if action == ActionType.DELETE_AND_MUTE:
             extra["mute_hours"] = MUTE_HOURS
         return Decision(action, verdict, reason, extra)
+    if verdict.violation_probability >= t.suspect:
+        # Jev calls it fine, but not by much: let the admin decide instead of missing a violation.
+        return Decision(ActionType.SEND_TO_REVIEW, verdict, "возможное нарушение")
     if verdict.category == Category.USEFUL and verdict.confidence >= t.useful_confidence:
         return Decision(ActionType.FORWARD_USEFUL, verdict, reason)
     return Decision(ActionType.NONE, verdict, reason)
@@ -282,18 +343,18 @@ class Moderator:
 
     async def check(self, comment: Comment, config: ChatConfig, known: str | None = None) -> Decision:
         """`known` is what the admin (or the bot itself) already decided about this exact text."""
-        if config.lockdown:
-            return _blanket_decision(None, "включён режим тишины")
-        if config.blanket:
-            return _blanket_decision(config.blanket, f"правило «{config.blanket.text.rstrip('.!; ')}»")
-        if not needs_check(comment.text):
+        if config.lockdown or config.blanket:
+            return self._blanket(config)
+        if not needs_check(comment.text, comment.links):
             return Decision(ActionType.NONE)
         if known == "allow":
             return Decision(ActionType.NONE, None, "админ уже разрешил такой комментарий")
         if known == "remove":
             return _blanket_decision(Rule("", PROHIBITION, "delete"), "такой комментарий уже удаляли")
         prohibitions = config.prohibitions
-        response = await self.jev.ask(build_state(comment, config.rules), build_questions(prohibitions))
+        response = await self.jev.ask(
+            build_state(comment, config.rules), build_questions(prohibitions, config.analytics)
+        )
         return decide(
             parse_verdict(response),
             prohibitions,
@@ -301,6 +362,25 @@ class Moderator:
             config.escalation,
             comment.author.previous_deletions,
         )
+
+    def fallback(self, comment: Comment, config: ChatConfig) -> Decision:
+        """Local protection for the time Jev is down: only well-known spam, only with a lead-away."""
+        if config.blanket or config.lockdown:
+            return self._blanket(config)
+        if looks_like_spam(comment.text, comment.links):
+            return _blanket_decision(Rule("", PROHIBITION, "delete"), "спам (ИИ был недоступен)")
+        return Decision(ActionType.NONE)
+
+    @staticmethod
+    def _blanket(config: ChatConfig) -> Decision:
+        if config.lockdown:
+            return _blanket_decision(None, "включён режим тишины")
+        return _blanket_decision(config.blanket, f"правило «{config.blanket.text.rstrip('.!; ')}»")
+
+    @staticmethod
+    def flood_decision(minutes: int = FLOOD_MUTE_MINUTES) -> Decision:
+        verdict = Verdict(Category.RULE_VIOLATION, 1.0, 0.0)
+        return Decision(ActionType.DELETE_AND_MUTE, verdict, "флуд: слишком много сообщений подряд", {"mute_hours": minutes / 60})
 
     async def parse_rules(self, admin_text: str) -> list[Rule]:
         """Classify every sentence of the admin's text: what it is and what to do about it."""

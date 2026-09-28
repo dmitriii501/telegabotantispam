@@ -17,7 +17,9 @@ apt-get install -y -q python3 python3-venv python3-pip rsync
 id -u defenceai >/dev/null 2>&1 || useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin defenceai
 
 mkdir -p "$APP_DIR"
-rsync -a --delete --exclude '.git' --exclude '.env' --exclude 'bot.db' --exclude '.venv' --exclude '__pycache__' ./ "$APP_DIR"/
+# Stop the bot first so the database is closed cleanly; never touch bot.db, bot.db-wal or bot.db-shm.
+systemctl stop "$SERVICE" 2>/dev/null || true
+rsync -a --delete --exclude '.git' --exclude '.env' --exclude 'bot.db*' --exclude '.venv' --exclude '__pycache__' ./ "$APP_DIR"/
 
 python3 -m venv "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install -q --upgrade pip

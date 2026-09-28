@@ -27,7 +27,7 @@ MAX_RULE_LENGTH = 300
 MAX_PARSE_LENGTH = 2000
 KINDS = {PROHIBITION, PERMISSION, CONTEXT, EVERYTHING}
 USEFUL_MODES = {"digest", "instant", "off"}
-BOOL_SETTINGS = ("lockdown", "escalation", "digest", "enabled", "conflicts")
+BOOL_SETTINGS = ("lockdown", "escalation", "digest", "enabled", "conflicts", "antiflood", "analytics", "observe")
 DELETING = {a.value for a in DELETING_ACTIONS}
 
 CSP = (
@@ -131,6 +131,9 @@ def chat_payload(chat, trusted) -> dict:
             "lockdown": config.lockdown,
             "escalation": config.escalation,
             "conflicts": config.conflicts,
+            "antiflood": config.antiflood,
+            "analytics": config.analytics,
+            "observe": config.observe,
             "digest": bool(chat["digest"]),
             "useful_mode": chat["useful_mode"],
             "enabled": bool(chat["enabled"]),
@@ -234,8 +237,44 @@ async def get_log(request: web.Request) -> web.Response:
                     "action": e["action"],
                     "reason": e["reason"],
                     "feedback": e["feedback"],
+                    "executed": bool(e["executed"]),
                 }
                 for e in entries
+            ],
+        }
+    )
+
+
+async def get_insights(request: web.Request) -> web.Response:
+    import time
+
+    chat = await admin_chat(request)
+    try:
+        days = min(max(int(request.query.get("days", "7")), 1), 30)
+    except ValueError:
+        raise ApiError(400, "Некорректный период")
+    storage = request.app["adapter"].storage
+    chat_id = chat["chat_id"]
+    since = int(time.time()) - days * 24 * 3600
+    waiting = await storage.unanswered(chat_id, since)
+    return web.json_response(
+        {
+            "days": days,
+            "analytics": bool(chat["analytics"]),
+            "kinds": await storage.kind_counts(chat_id, since),
+            "mood": await storage.sentiment_summary(chat_id, since),
+            "waiting": [
+                {
+                    "id": r["id"],
+                    "message_id": r["message_id"],
+                    "user_name": r["user_name"],
+                    "text": r["text"][:300],
+                    "lead": r["lead"] or 0,
+                    "needs_answer": r["needs_answer"] or 0,
+                    "kind": r["kind"],
+                    "ts": r["ts"],
+                }
+                for r in waiting
             ],
         }
     )
@@ -296,6 +335,7 @@ def create_app(adapter, bot_token: str) -> web.Application:
     app.router.add_put("/api/chat/{chat_id}/settings", put_settings)
     app.router.add_post("/api/chat/{chat_id}/parse", parse_text)
     app.router.add_get("/api/chat/{chat_id}/log", get_log)
+    app.router.add_get("/api/chat/{chat_id}/insights", get_insights)
     app.router.add_post("/api/chat/{chat_id}/log/{log_id}/restore", restore)
     app.router.add_post("/api/chat/{chat_id}/log/{log_id}/review", review)
     app.router.add_post("/api/chat/{chat_id}/log/{log_id}/trust", trust_author)

@@ -25,6 +25,8 @@ class Comment:
     # Context the rules may refer to: "не по теме поста", "оскорбляет собеседника".
     post_text: str | None = None
     reply_to_text: str | None = None
+    # Links the text hides or shows: «слово» → https://..., or a plain url.
+    links: list[str] = field(default_factory=list)
 
 
 class Category(str, Enum):
@@ -42,6 +44,13 @@ class Verdict:
     # Index into the prohibitions list of the chat config, or None when no rule applies.
     rule_index: int | None = None
     input_tokens: int = 0
+    # Chance that the comment breaks the rules, from Jev's probabilities (spam + violation).
+    violation_probability: float = 0.0
+    # Analytics: filled in when the request carried the extra questions.
+    kind: str | None = None
+    lead: float = 0.0  # wants to buy, asks the price, asks to be contacted
+    needs_answer: float = 0.0  # the author waits for a reply from the owner
+    sentiment: float | None = None  # 0 negative .. 2 positive
 
 
 class ActionType(str, Enum):

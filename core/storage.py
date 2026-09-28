@@ -36,7 +36,16 @@ CREATE TABLE IF NOT EXISTS log (
     reason TEXT,
     tokens INTEGER NOT NULL DEFAULT 0,
     -- set when an admin overrides the bot: 'not_spam' or 'confirmed'
-    feedback TEXT
+    feedback TEXT,
+    -- 0 when the action was not carried out: observe mode, or Telegram refused
+    executed INTEGER NOT NULL DEFAULT 1,
+    kind TEXT,
+    lead REAL,
+    needs_answer REAL,
+    sentiment REAL,
+    violation REAL,
+    -- 1 once an admin replied to the comment
+    answered INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS appeals (
     user_id INTEGER NOT NULL,
@@ -75,10 +84,23 @@ CHAT_COLUMNS = [
     ("useful_mode", "TEXT NOT NULL DEFAULT 'digest'"),
     ("digest_last", "TEXT"),
     ("conflicts", "INTEGER NOT NULL DEFAULT 1"),
+    ("antiflood", "INTEGER NOT NULL DEFAULT 1"),
+    ("analytics", "INTEGER NOT NULL DEFAULT 1"),
+    ("observe", "INTEGER NOT NULL DEFAULT 0"),
+]
+LOG_COLUMNS = [
+    ("executed", "INTEGER NOT NULL DEFAULT 1"),
+    ("kind", "TEXT"),
+    ("lead", "REAL"),
+    ("needs_answer", "REAL"),
+    ("sentiment", "REAL"),
+    ("violation", "REAL"),
+    ("answered", "INTEGER NOT NULL DEFAULT 0"),
 ]
 SETTINGS = {name for name, _ in CHAT_COLUMNS} - {"rules_json", "pending_json", "digest_last"} | {"enabled"}
 
 DAY = 24 * 3600
+DELETION_WINDOW_DAYS = 30
 DELETING = ("delete_and_ban", "delete_and_mute", "delete_silent", "delete_and_explain")
 
 
@@ -90,16 +112,21 @@ class Storage:
     async def open(self) -> None:
         self.db = await aiosqlite.connect(self.path)
         self.db.row_factory = aiosqlite.Row
+        await self.db.execute("PRAGMA journal_mode=WAL")
+        await self.db.execute("PRAGMA busy_timeout=5000")
+        await self.db.execute("PRAGMA synchronous=NORMAL")
         await self.db.executescript(SCHEMA)
-        async with self.db.execute("PRAGMA table_info(chats)") as cur:
-            existing = {row["name"] for row in await cur.fetchall()}
-        for name, definition in CHAT_COLUMNS:
-            if name not in existing:
-                await self.db.execute(f"ALTER TABLE chats ADD COLUMN {name} {definition}")
-        async with self.db.execute("PRAGMA table_info(trusted)") as cur:
-            if "name" not in {row["name"] for row in await cur.fetchall()}:
-                await self.db.execute("ALTER TABLE trusted ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+        await self._add_missing_columns("chats", CHAT_COLUMNS)
+        await self._add_missing_columns("log", LOG_COLUMNS)
+        await self._add_missing_columns("trusted", [("name", "TEXT NOT NULL DEFAULT ''")])
         await self.db.commit()
+
+    async def _add_missing_columns(self, table: str, columns: list[tuple[str, str]]) -> None:
+        async with self.db.execute(f"PRAGMA table_info({table})") as cur:
+            existing = {row["name"] for row in await cur.fetchall()}
+        for name, definition in columns:
+            if name not in existing:
+                await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     async def close(self) -> None:
         if self.db:
@@ -111,9 +138,11 @@ class Storage:
         async with self.db.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,)) as cur:
             return await cur.fetchone()
 
-    async def ensure_chat(self, chat_id: int) -> None:
-        await self.db.execute("INSERT OR IGNORE INTO chats (chat_id) VALUES (?)", (chat_id,))
+    async def ensure_chat(self, chat_id: int) -> bool:
+        """Create the chat row if missing; True when it was just created."""
+        cur = await self.db.execute("INSERT OR IGNORE INTO chats (chat_id) VALUES (?)", (chat_id,))
         await self.db.commit()
+        return cur.rowcount == 1
 
     async def set_pending_rules(self, chat_id: int, text: str, rules_json: str) -> None:
         await self.ensure_chat(chat_id)
@@ -165,27 +194,36 @@ class Storage:
 
     # --- users ---
 
-    async def user_counters(self, chat_id: int, user_id: int) -> tuple[int, int]:
+    async def message_count(self, chat_id: int, user_id: int) -> int:
         async with self.db.execute(
-            "SELECT messages, deletions FROM users WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+            "SELECT messages FROM users WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
         ) as cur:
             row = await cur.fetchone()
-        return (row["messages"], row["deletions"]) if row else (0, 0)
+        return row["messages"] if row else 0
 
-    async def count_message(self, chat_id: int, user_id: int, deleted: bool) -> None:
+    async def count_message(self, chat_id: int, user_id: int) -> None:
+        """Count a message from the author. Deletions are counted from the log, see `recent_deletions`."""
         await self.db.execute(
-            """INSERT INTO users (chat_id, user_id, messages, deletions) VALUES (?, ?, 1, ?)
-               ON CONFLICT (chat_id, user_id) DO UPDATE SET
-               messages = messages + 1, deletions = deletions + excluded.deletions""",
-            (chat_id, user_id, int(deleted)),
+            """INSERT INTO users (chat_id, user_id, messages, deletions) VALUES (?, ?, 1, 0)
+               ON CONFLICT (chat_id, user_id) DO UPDATE SET messages = messages + 1""",
+            (chat_id, user_id),
         )
         await self.db.commit()
 
-    async def reset_deletions(self, chat_id: int, user_id: int) -> None:
-        await self.db.execute(
-            "UPDATE users SET deletions = MAX(deletions - 1, 0) WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
-        )
-        await self.db.commit()
+    async def recent_deletions(self, chat_id: int, user_id: int, days: int = DELETION_WINDOW_DAYS) -> int:
+        """Comments of this author that were really removed in the last `days` days.
+
+        Counts carried-out deletions the admin did not overrule, and review cases the admin confirmed.
+        """
+        marks = ", ".join("?" for _ in DELETING)
+        async with self.db.execute(
+            f"""SELECT COUNT(*) FROM log WHERE chat_id = ? AND user_id = ? AND ts >= ? AND (
+                    (action IN ({marks}) AND executed = 1 AND COALESCE(feedback, '') != 'not_spam')
+                 OR (action = 'send_to_review' AND feedback = 'confirmed'))""",
+            (chat_id, user_id, int(time.time()) - days * DAY, *DELETING),
+        ) as cur:
+            (n,) = await cur.fetchone()
+        return n
 
     # --- trusted users ---
 
@@ -233,6 +271,17 @@ class Storage:
         cur = await self.db.execute(f"INSERT INTO log ({cols}) VALUES ({marks})", tuple(fields.values()))
         await self.db.commit()
         return cur.lastrowid
+
+    async def set_executed(self, log_id: int, executed: bool) -> None:
+        await self.db.execute("UPDATE log SET executed = ? WHERE id = ?", (int(executed), log_id))
+        await self.db.commit()
+
+    async def mark_answered(self, chat_id: int, message_id: int) -> None:
+        """An admin replied to this comment: it no longer waits for an answer."""
+        await self.db.execute(
+            "UPDATE log SET answered = 1 WHERE chat_id = ? AND message_id = ?", (chat_id, message_id)
+        )
+        await self.db.commit()
 
     async def get_log(self, log_id: int) -> aiosqlite.Row | None:
         async with self.db.execute("SELECT * FROM log WHERE id = ?", (log_id,)) as cur:
@@ -304,6 +353,44 @@ class Storage:
             (chat_id, since, limit),
         ) as cur:
             return await cur.fetchall()
+
+    # --- analytics ---
+
+    async def kind_counts(self, chat_id: int, since: int) -> dict[str, int]:
+        async with self.db.execute(
+            """SELECT kind, COUNT(*) AS n FROM log WHERE chat_id = ? AND ts >= ? AND kind IS NOT NULL
+               AND category IN ('normal', 'useful') GROUP BY kind""",
+            (chat_id, since),
+        ) as cur:
+            return {row["kind"]: row["n"] for row in await cur.fetchall()}
+
+    async def sentiment_summary(self, chat_id: int, since: int) -> dict:
+        async with self.db.execute(
+            """SELECT COUNT(*) AS n, AVG(sentiment) AS avg,
+                      SUM(sentiment < 0.7) AS neg, SUM(sentiment > 1.3) AS pos
+               FROM log WHERE chat_id = ? AND ts >= ? AND sentiment IS NOT NULL AND category IN ('normal', 'useful')""",
+            (chat_id, since),
+        ) as cur:
+            row = await cur.fetchone()
+        return {"n": row["n"] or 0, "avg": row["avg"], "negative": row["neg"] or 0, "positive": row["pos"] or 0}
+
+    async def unanswered(self, chat_id: int, since: int, min_score: float = 0.6, limit: int = 20) -> list[aiosqlite.Row]:
+        """Comments whose author waits for an answer (or wants to buy) and got none from an admin."""
+        async with self.db.execute(
+            """SELECT * FROM log WHERE chat_id = ? AND ts >= ? AND answered = 0
+               AND category IN ('normal', 'useful') AND (needs_answer >= ? OR lead >= ?)
+               ORDER BY lead DESC, needs_answer DESC, id DESC LIMIT ?""",
+            (chat_id, since, min_score, min_score, limit),
+        ) as cur:
+            return await cur.fetchall()
+
+    async def purge_old(self, days: int) -> int:
+        """Drop comment texts and log rows older than `days` (personal data must not live forever)."""
+        cutoff = int(time.time()) - days * DAY
+        cur = await self.db.execute("DELETE FROM log WHERE ts < ?", (cutoff,))
+        await self.db.execute("DELETE FROM appeals WHERE ts < ?", (cutoff,))
+        await self.db.commit()
+        return cur.rowcount
 
     async def digest_chats(self) -> list[aiosqlite.Row]:
         async with self.db.execute(

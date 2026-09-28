@@ -124,10 +124,15 @@ async def test_invalid_rules_rejected(client, bad):
 
 
 async def test_settings_partial_update_and_validation(client):
-    ok = await client.put(f"/api/chat/{CHAT}/settings", json={"mode": "strict", "lockdown": True}, headers=h())
+    ok = await client.put(
+        f"/api/chat/{CHAT}/settings",
+        json={"mode": "strict", "lockdown": True, "observe": True, "antiflood": False, "analytics": False},
+        headers=h(),
+    )
     assert ok.status == 200
     s = (await (await client.get(f"/api/chat/{CHAT}", headers=h())).json())["settings"]
     assert s["mode"] == "strict" and s["lockdown"] is True and s["escalation"] is True
+    assert s["observe"] is True and s["antiflood"] is False and s["analytics"] is False
     for bad in ({"mode": "insane"}, {"lockdown": "yes"}, {"owner_id": 1}, {"useful_mode": "x"}):
         assert (await client.put(f"/api/chat/{CHAT}/settings", json=bad, headers=h())).status == 400
 
@@ -182,3 +187,25 @@ async def test_trust_and_untrust(client):
     assert data["trusted"] == [{"user_id": 5, "name": "Вася"}]
     assert (await client.delete(f"/api/chat/{CHAT}/trusted/5", headers=h())).status == 200
     assert (await (await client.get(f"/api/chat/{CHAT}", headers=h())).json())["trusted"] == []
+
+
+async def test_insights_endpoint(client):
+    await client.storage.add_log(
+        chat_id=CHAT, message_id=7, user_id=5, user_name="Вася", text="Сколько стоит?", category="normal",
+        confidence=0.9, bot_probability=0.1, action="none", reason="", tokens=1,
+        kind="question", lead=0.9, needs_answer=0.9, sentiment=1.0,
+    )
+    data = await (await client.get(f"/api/chat/{CHAT}/insights?days=7", headers=h())).json()
+    assert data["kinds"] == {"question": 1}
+    assert [w["message_id"] for w in data["waiting"]] == [7]
+    assert (await client.get(f"/api/chat/{CHAT}/insights?days=abc", headers=h())).status == 400
+    assert (await client.get(f"/api/chat/{CHAT}/insights", headers=h({"id": 7, "first_name": "X"}))).status == 403
+
+
+async def test_log_marks_dry_run_entries(client):
+    entry = await client.storage.add_log(
+        chat_id=CHAT, message_id=9, user_id=5, user_name="Вася", text="спам", category="spam", confidence=0.9,
+        bot_probability=0.8, action="delete_and_ban", reason="спам", tokens=1, executed=0,
+    )
+    data = await (await client.get(f"/api/chat/{CHAT}/log", headers=h())).json()
+    assert data["entries"][0]["id"] == entry and data["entries"][0]["executed"] is False
