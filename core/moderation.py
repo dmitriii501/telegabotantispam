@@ -4,12 +4,23 @@ Everything here is platform-independent. Adapters build a `Comment`, call
 `Moderator.check`, and execute the returned `Decision`.
 """
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from core.jev_client import JevClient
 from core.models import ActionType, Category, Comment, Decision, Verdict
 from core.normalizer import normalize
-from core.rules import MENTION_QUESTION, TOPICS, rule_list
+from core.rules import (
+    BASE_RULE,
+    EVERYTHING,
+    PROHIBITION,
+    Rule,
+    build_parse_questions,
+    parse_rules_response,
+    rules_from_json,
+    rules_from_text,
+    split_rules,
+)
 
 CATEGORY_CRITERIA = {
     Category.SPAM.value: (
@@ -25,8 +36,23 @@ CATEGORY_CRITERIA = {
     Category.NORMAL.value: "Обычный допустимый комментарий: реакция, мнение, благодарность, шутка.",
 }
 
+ACTION_MAP = {
+    "ban": ActionType.DELETE_AND_BAN,
+    "mute": ActionType.DELETE_AND_MUTE,
+    "warn": ActionType.DELETE_AND_EXPLAIN,
+    "delete": ActionType.DELETE_SILENT,
+    "review": ActionType.SEND_TO_REVIEW,
+}
+
 # Comments without letters or links (emoji, "+", "!!!") are never sent to Jev.
 MIN_LETTERS = 2
+
+# Repeat offenders: the Nth deleted comment in a chat escalates the action.
+MUTE_AT = 3
+BAN_AT = 5
+MUTE_HOURS = 24
+
+CONTEXT_LIMIT = 600
 
 
 @dataclass
@@ -38,12 +64,61 @@ class Thresholds:
     useful_confidence: float = 0.7
 
 
+MODES = {
+    "soft": Thresholds(review_below=0.85, ban_confidence=0.95, ban_bot_probability=0.8),
+    "normal": Thresholds(),
+    "strict": Thresholds(review_below=0.55, ban_confidence=0.85, ban_bot_probability=0.6),
+}
+
+
+@dataclass
+class ChatConfig:
+    rules: list[Rule] = field(default_factory=list)  # what the admin wrote, all kinds
+    mode: str = "normal"
+    lockdown: bool = False  # delete everything from non-admins
+    escalation: bool = True
+
+    @property
+    def prohibitions(self) -> list[Rule]:
+        """Rules Jev may pick as violated. Index 0 is always the built-in spam rule."""
+        return [BASE_RULE, *(r for r in self.rules if r.kind == PROHIBITION)]
+
+    @property
+    def blanket(self) -> Rule | None:
+        return next((r for r in self.rules if r.kind == EVERYTHING), None)
+
+    @property
+    def thresholds(self) -> Thresholds:
+        return MODES.get(self.mode, MODES["normal"])
+
+    @classmethod
+    def from_row(cls, row: Mapping | None) -> "ChatConfig":
+        if row is None:
+            return cls()
+        if row["rules_json"]:
+            rules = rules_from_json(row["rules_json"])
+        else:
+            rules = rules_from_text(row["rules"] or "")
+        return cls(
+            rules=rules,
+            mode=row["mode"] or "normal",
+            lockdown=bool(row["lockdown"]),
+            escalation=bool(row["escalation"]),
+        )
+
+
 def needs_check(text: str) -> bool:
     letters = sum(ch.isalpha() for ch in text)
     return letters >= MIN_LETTERS or "http" in text or "t.me" in text or "@" in text
 
 
-def build_state(comment: Comment, rules: list[str]) -> dict:
+def _clip(text: str | None) -> str | None:
+    if not text:
+        return None
+    return text if len(text) <= CONTEXT_LIMIT else text[:CONTEXT_LIMIT] + "…"
+
+
+def build_state(comment: Comment, rules: list[Rule]) -> dict:
     normalized = normalize(comment.text)
     a = comment.author
     author = {
@@ -53,14 +128,20 @@ def build_state(comment: Comment, rules: list[str]) -> dict:
         "first_message_in_this_chat": a.previous_messages == 0,
         "previously_deleted_messages": a.previous_deletions,
     }
-    state = {"rules": rules, "comment": comment.text, "author": author}
+    # Everything the admin wrote goes in: permissions and context help Jev too.
+    texts = [BASE_RULE.text, *(r.text for r in rules if r.kind != EVERYTHING)]
+    state = {"rules": texts, "comment": comment.text, "author": author}
     if normalized != comment.text:
         state["comment_with_letters_restored"] = normalized
+    if comment.post_text:
+        state["post_the_comment_is_under"] = _clip(comment.post_text)
+    if comment.reply_to_text:
+        state["comment_being_replied_to"] = _clip(comment.reply_to_text)
     return state
 
 
-def build_questions(rules: list[str]) -> dict:
-    rule_options = {f"r{i}": text for i, text in enumerate(rules)}
+def build_questions(prohibitions: list[Rule]) -> dict:
+    rule_options = {f"r{i}": rule.text for i, rule in enumerate(prohibitions)}
     rule_options["none"] = "Комментарий не нарушает ни одно правило"
     return {
         "category": {
@@ -96,68 +177,107 @@ def parse_verdict(response: dict) -> Verdict:
     )
 
 
-def decide(verdict: Verdict, rules: list[str], t: Thresholds = Thresholds()) -> Decision:
-    reason = explain(verdict, rules)
+def _matched_rule(verdict: Verdict, prohibitions: list[Rule]) -> Rule | None:
+    i = verdict.rule_index
+    return prohibitions[i] if i is not None and 0 <= i < len(prohibitions) else None
+
+
+def _auto_action(verdict: Verdict, t: Thresholds) -> ActionType:
+    if (
+        verdict.category == Category.SPAM
+        and verdict.confidence >= t.ban_confidence
+        and verdict.bot_probability >= t.ban_bot_probability
+    ):
+        return ActionType.DELETE_AND_BAN
+    if verdict.bot_probability > t.silent_bot_probability:
+        # A bot, or we are not sure it is a human: do not teach spammers what we catch.
+        return ActionType.DELETE_SILENT
+    return ActionType.DELETE_AND_EXPLAIN
+
+
+def decide(
+    verdict: Verdict,
+    prohibitions: list[Rule],
+    t: Thresholds = Thresholds(),
+    escalation: bool = True,
+    previous_deletions: int = 0,
+) -> Decision:
+    reason = explain(verdict, prohibitions)
     if verdict.category in (Category.SPAM, Category.RULE_VIOLATION):
         if verdict.confidence < t.review_below:
-            action = ActionType.SEND_TO_REVIEW
-        elif (
-            verdict.category == Category.SPAM
-            and verdict.confidence >= t.ban_confidence
-            and verdict.bot_probability >= t.ban_bot_probability
-        ):
-            action = ActionType.DELETE_AND_BAN
-        elif verdict.bot_probability > t.silent_bot_probability:
-            # A bot, or we are not sure it is a human: do not teach spammers what we catch.
-            action = ActionType.DELETE_SILENT
+            return Decision(ActionType.SEND_TO_REVIEW, verdict, reason)
+        rule = _matched_rule(verdict, prohibitions)
+        if rule and rule.action:
+            action = ACTION_MAP[rule.action]
         else:
-            action = ActionType.DELETE_AND_EXPLAIN
-        return Decision(action, verdict, reason)
+            action = _auto_action(verdict, t)
+        if action == ActionType.DELETE_AND_EXPLAIN and verdict.bot_probability > t.silent_bot_probability:
+            action = ActionType.DELETE_SILENT  # never explain to a probable spammer
+        extra = {}
+        if escalation and action in (
+            ActionType.DELETE_SILENT,
+            ActionType.DELETE_AND_EXPLAIN,
+            ActionType.DELETE_AND_MUTE,
+        ):
+            strikes = previous_deletions + 1
+            if strikes >= BAN_AT:
+                action, reason = ActionType.DELETE_AND_BAN, f"{reason} (повторные нарушения)"
+            elif strikes >= MUTE_AT and action != ActionType.DELETE_AND_MUTE:
+                action, reason = ActionType.DELETE_AND_MUTE, f"{reason} (повторные нарушения)"
+        if action == ActionType.DELETE_AND_MUTE:
+            extra["mute_hours"] = MUTE_HOURS
+        return Decision(action, verdict, reason, extra)
     if verdict.category == Category.USEFUL and verdict.confidence >= t.useful_confidence:
         return Decision(ActionType.FORWARD_USEFUL, verdict, reason)
     return Decision(ActionType.NONE, verdict, reason)
 
 
-def explain(verdict: Verdict, rules: list[str]) -> str:
+def explain(verdict: Verdict, prohibitions: list[Rule]) -> str:
     """Reason text from templates: Jev picks the rule, the bot quotes it."""
+    rule = _matched_rule(verdict, prohibitions)
+    if rule and rule is not BASE_RULE and verdict.category in (Category.SPAM, Category.RULE_VIOLATION):
+        return f"нарушено правило «{rule.text.rstrip('.!; ')}»"
     if verdict.category == Category.SPAM:
         return "спам или реклама"
     if verdict.category == Category.RULE_VIOLATION:
-        if verdict.rule_index is not None and 0 < verdict.rule_index < len(rules):
-            return f"нарушено правило «{rules[verdict.rule_index]}»"
         return "нарушение правил чата"
     if verdict.category == Category.USEFUL:
         return "полезный комментарий"
     return ""
 
 
-class Moderator:
-    def __init__(self, jev: JevClient, thresholds: Thresholds = Thresholds()):
-        self.jev = jev
-        self.thresholds = thresholds
+def _blanket_decision(rule: Rule | None, reason: str) -> Decision:
+    action = ACTION_MAP[(rule.action if rule and rule.action else "delete")]
+    verdict = Verdict(Category.RULE_VIOLATION, 1.0, 0.0)
+    extra = {"mute_hours": MUTE_HOURS} if action == ActionType.DELETE_AND_MUTE else {}
+    return Decision(action, verdict, reason, extra)
 
-    async def check(self, comment: Comment, admin_rules_text: str) -> Decision:
+
+class Moderator:
+    def __init__(self, jev: JevClient):
+        self.jev = jev
+
+    async def check(self, comment: Comment, config: ChatConfig) -> Decision:
+        if config.lockdown:
+            return _blanket_decision(None, "включён режим тишины")
+        if config.blanket:
+            return _blanket_decision(config.blanket, f"правило «{config.blanket.text.rstrip('.!; ')}»")
         if not needs_check(comment.text):
             return Decision(ActionType.NONE)
-        rules = rule_list(admin_rules_text)
-        response = await self.jev.ask(build_state(comment, rules), build_questions(rules))
-        return decide(parse_verdict(response), rules, self.thresholds)
+        prohibitions = config.prohibitions
+        response = await self.jev.ask(build_state(comment, config.rules), build_questions(prohibitions))
+        return decide(
+            parse_verdict(response),
+            prohibitions,
+            config.thresholds,
+            config.escalation,
+            comment.author.previous_deletions,
+        )
 
-    async def preview_rules(self, admin_rules_text: str) -> list[tuple[str, str]]:
-        """How Jev understood the rules: [(label, "allowed" | "forbidden" | "unspecified")]."""
-        questions = {}
-        for key, (question, label) in TOPICS.items():
-            questions[f"{key}_allowed"] = {"type": "noul", "instructions": question}
-            questions[f"{key}_mentioned"] = {"type": "noul", "instructions": MENTION_QUESTION.format(label=label)}
-        response = await self.jev.ask({"rules": admin_rules_text}, questions)
-        answers = response["answers"]
-        result = []
-        for key, (_, label) in TOPICS.items():
-            if answers[f"{key}_mentioned"]["noul"] < 0.5:
-                status = "unspecified"
-            elif answers[f"{key}_allowed"]["noul"] >= 0.5:
-                status = "allowed"
-            else:
-                status = "forbidden"
-            result.append((label, status))
-        return result
+    async def parse_rules(self, admin_text: str) -> list[Rule]:
+        """Classify every sentence of the admin's text: what it is and what to do about it."""
+        sentences = split_rules(admin_text)
+        if not sentences:
+            return []
+        response = await self.jev.ask({"rules_text": admin_text}, build_parse_questions(sentences))
+        return parse_rules_response(sentences, response)

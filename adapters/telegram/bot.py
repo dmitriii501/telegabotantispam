@@ -7,7 +7,9 @@ and in ordinary groups. It needs admin rights to delete messages and ban users.
 import asyncio
 import html
 import logging
+import os
 import time
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
@@ -16,23 +18,47 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     CallbackQuery,
     ChatMemberUpdated,
+    ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
 
 from core.jev_client import JevError
-from core.models import ActionType, Author, Comment, Decision
-from core.moderation import Moderator
-from core.storage import Storage
+from core.models import DELETING_ACTIONS, ActionType, Author, Comment, Decision
+from core.moderation import MODES, ChatConfig, Moderator
+from core.rules import CONTEXT, EVERYTHING, PERMISSION, Rule, rules_to_json
+from core.storage import DAY, Storage
 
 log = logging.getLogger(__name__)
 
 GROUPS = F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP})
 EXPLANATION_TTL = 60  # seconds before the "comment deleted" notice disappears
 ADMIN_CACHE_TTL = 600
+DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", "6"))  # 06:00 UTC = 09:00 Moscow
 
-STATUS_ICON = {"allowed": "✅ можно", "forbidden": "❌ нельзя", "unspecified": "— не указано"}
+ACTION_LABEL = {
+    "ban": "удалять и банить",
+    "mute": "удалять и мутить на сутки",
+    "warn": "удалять с предупреждением",
+    "delete": "просто удалять",
+    "review": "присылать вам на проверку",
+    None: "по ситуации: человеку объясню, бота уберу молча",
+}
+DECISION_LABEL = {
+    ActionType.NONE: "оставил бы",
+    ActionType.DELETE_AND_BAN: "удалил бы и забанил",
+    ActionType.DELETE_AND_MUTE: "удалил бы и замутил на сутки",
+    ActionType.DELETE_SILENT: "удалил бы молча",
+    ActionType.DELETE_AND_EXPLAIN: "удалил бы и объяснил автору",
+    ActionType.SEND_TO_REVIEW: "прислал бы вам на проверку",
+    ActionType.FORWARD_USEFUL: "переслал бы вам как полезный",
+}
+MODE_LABEL = {
+    "soft": "мягкий: сомнительное присылаю вам",
+    "normal": "обычный",
+    "strict": "строгий: удаляю при меньшей уверенности",
+}
 
 HELP_TEXT = (
     "Я модерирую комментарии с помощью ИИ: понимаю смысл, а не ищу стоп-слова, "
@@ -40,15 +66,23 @@ HELP_TEXT = (
     "<b>Как подключить</b>\n"
     "1. Добавьте меня в группу обсуждений канала (или в обычную группу).\n"
     "2. Сделайте меня админом с правами удалять сообщения и банить.\n"
-    "3. В группе напишите правила обычным языком:\n"
-    "<code>/rules Канал про крипту. Мат можно. Рекламу других каналов нельзя.</code>\n"
-    "4. Подтвердите, что я правильно понял правила.\n\n"
-    "Спам я удаляю всегда, даже без правил. Спорные комментарии, апелляции и полезные "
-    "комментарии присылаю в личку тому, кто подтвердил правила, поэтому напишите мне /start.\n\n"
+    "3. Напишите в группе правила обычным языком, можно сразу с действиями:\n"
+    "<code>/rules Канал про крипту. Мат можно. Рекламу нельзя — бан. "
+    "Политику — просто удалять. Оскорбления — предупреждать.</code>\n"
+    "4. Подтвердите, что я правильно понял.\n\n"
+    "Спам я удаляю всегда, даже без правил. Спорные комментарии, апелляции и сводки "
+    "присылаю в личку тому, кто подтвердил правила, поэтому напишите мне /start.\n\n"
     "<b>Команды в группе (только для админов)</b>\n"
     "/rules [текст] — задать или показать правила\n"
-    "/stats — статистика за сутки\n"
-    "/off, /on — выключить или включить модерацию"
+    "/settings — все настройки\n"
+    "/mode soft|normal|strict — строгость\n"
+    "/lockdown on|off — режим тишины: удалять всё от не-админов\n"
+    "/escalation on|off — мут и бан за повторные нарушения\n"
+    "/useful digest|instant|off — полезные комментарии: в сводку, сразу или никак\n"
+    "/digest on|off — ежедневная сводка\n"
+    "/check текст — что бы я сделал с таким комментарием\n"
+    "/trust, /untrust — ответом на сообщение: не проверять этого человека\n"
+    "/stats — статистика за сутки, /off и /on — пауза"
 )
 
 
@@ -58,15 +92,34 @@ def kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     )
 
 
-def message_link(chat, message_id: int) -> str:
-    if chat.username:
-        return f"https://t.me/{chat.username}/{message_id}"
-    return f"https://t.me/c/{str(chat.id).removeprefix('-100')}/{message_id}"
+def chat_message_link(chat_id: int, message_id: int, username: str | None = None) -> str:
+    if username:
+        return f"https://t.me/{username}/{message_id}"
+    return f"https://t.me/c/{str(chat_id).removeprefix('-100')}/{message_id}"
 
 
 def quote(text: str, limit: int = 700) -> str:
     text = text if len(text) <= limit else text[:limit] + "…"
     return f"<blockquote>{html.escape(text)}</blockquote>"
+
+
+def describe_rule(rule: Rule) -> str:
+    text = html.escape(rule.text.rstrip(".!; "))
+    if rule.kind == PERMISSION:
+        return f"✅ {text}"
+    if rule.kind == CONTEXT:
+        return f"ℹ️ {text}"
+    if rule.kind == EVERYTHING:
+        return f"🚫 {text} — {ACTION_LABEL[rule.action or 'delete']} <b>все комментарии</b>"
+    return f"❌ {text} — {ACTION_LABEL[rule.action]}"
+
+
+def describe_rules(rules: list[Rule]) -> str:
+    return "\n".join(describe_rule(r) for r in rules) or "правила не заданы"
+
+
+def on_off(value: bool) -> str:
+    return "включено" if value else "выключено"
 
 
 class TelegramAdapter:
@@ -127,8 +180,17 @@ class TelegramAdapter:
         if not getattr(me, "can_delete_messages", False):
             missing.append("удалять сообщения")
         if not getattr(me, "can_restrict_members", False):
-            missing.append("банить пользователей")
+            missing.append("банить и ограничивать пользователей")
         return missing
+
+    async def config(self, chat_id: int) -> ChatConfig:
+        return ChatConfig.from_row(await self.storage.get_chat(chat_id))
+
+    async def admin_args(self, message: Message, command: CommandObject) -> str | None:
+        """Arguments of an admin-only command, or None when the sender is not an admin."""
+        if not await self.is_admin_message(message):
+            return None
+        return (command.args or "").strip().lower()
 
     # ----------------------------------------------------------------- handlers
 
@@ -138,6 +200,14 @@ class TelegramAdapter:
         r.my_chat_member()(self.on_bot_added)
         r.message(Command("rules"), GROUPS)(self.on_rules)
         r.message(Command("stats"), GROUPS)(self.on_stats)
+        r.message(Command("settings"), GROUPS)(self.on_settings)
+        r.message(Command("mode"), GROUPS)(self.on_mode)
+        r.message(Command("lockdown"), GROUPS)(self.on_lockdown)
+        r.message(Command("escalation"), GROUPS)(self.on_escalation)
+        r.message(Command("digest"), GROUPS)(self.on_digest)
+        r.message(Command("useful"), GROUPS)(self.on_useful)
+        r.message(Command("check"), GROUPS)(self.on_check)
+        r.message(Command("trust", "untrust"), GROUPS)(self.on_trust)
         r.message(Command("off", "on"), GROUPS)(self.on_toggle)
         r.callback_query(F.data.startswith("rules:"))(self.on_rules_button)
         r.callback_query(F.data.startswith("appeal:"))(self.on_appeal)
@@ -160,34 +230,41 @@ class TelegramAdapter:
         else:
             text = (
                 "Готов к работе. Спам удаляю уже сейчас.\n"
-                "Задайте правила обычным языком: <code>/rules мат можно, рекламу нельзя</code>"
+                "Задайте правила обычным языком: <code>/rules мат можно, рекламу нельзя — бан</code>"
             )
         try:
             await self.bot.send_message(event.chat.id, text)
         except TelegramAPIError:
             pass
 
+    # ------------------------------------------------------------------- rules
+
     async def on_rules(self, message: Message, command: CommandObject) -> None:
         if not await self.is_admin_message(message):
             return
         chat_id = message.chat.id
         if not command.args:
-            chat = await self.storage.get_chat(chat_id)
-            rules = chat["rules"] if chat and chat["rules"] else "не заданы (удаляю только спам)"
-            await message.reply(f"Текущие правила: {html.escape(rules)}\n\nИзменить: <code>/rules текст</code>")
+            config = await self.config(chat_id)
+            await message.reply(
+                f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам — всегда\n\n"
+                "Изменить: <code>/rules текст</code>"
+            )
             return
         text = command.args.strip()
         try:
-            preview = await self.moderator.preview_rules(text)
+            rules = await self.moderator.parse_rules(text)
         except JevError as e:
-            log.error("Rules preview failed: %s", e)
+            log.error("Rules parsing failed: %s", e)
             await message.reply("Не получилось разобрать правила: ИИ временно недоступен. Попробуйте позже.")
             return
-        await self.storage.set_pending_rules(chat_id, text)
-        lines = "\n".join(f"{label}: {STATUS_ICON[status]}" for label, status in preview)
+        if not rules:
+            await message.reply("Не вижу правил в этом тексте. Напишите, например: <code>/rules рекламу нельзя</code>")
+            return
+        await self.storage.set_pending_rules(chat_id, text, rules_to_json(rules))
         await message.reply(
-            f"Понял так:\n{lines}\nСпам: ❌ нельзя (всегда)\n\n"
-            f"Проверять буду по вашему тексту целиком, а это краткая выжимка. Всё верно?",
+            f"Понял так:\n{describe_rules(rules)}\n❌ спам — всегда\n\n"
+            "Если в правиле не названо действие, решаю сам: человеку объясняю, бота убираю молча. "
+            "Всё верно?",
             reply_markup=kb([("✅ Всё верно", f"rules:ok:{chat_id}"), ("✏️ Исправить", f"rules:no:{chat_id}")]),
         )
 
@@ -201,20 +278,125 @@ class TelegramAdapter:
             if not await self.storage.confirm_rules(chat_id, call.from_user.id):
                 await call.answer("Эти правила уже неактуальны.")
                 return
-            reached = await self.dm(call.from_user.id, "Правила сохранены. Сюда буду присылать спорные и полезные комментарии.")
-            note = "" if reached else "\n\nНапишите мне /start в личку, чтобы получать спорные и полезные комментарии."
+            reached = await self.dm(
+                call.from_user.id, "Правила сохранены. Сюда буду присылать спорные комментарии и ежедневную сводку."
+            )
+            note = "" if reached else "\n\nНапишите мне /start в личку, чтобы получать спорные комментарии и сводки."
             await call.message.edit_text("Правила сохранены ✅" + note)
         else:
             await self.storage.discard_pending_rules(chat_id)
             await call.message.edit_text("Хорошо, напишите правила заново: <code>/rules текст</code>")
         await call.answer()
 
+    # ---------------------------------------------------------------- settings
+
+    async def on_settings(self, message: Message) -> None:
+        if not await self.is_admin_message(message):
+            return
+        chat = await self.storage.get_chat(message.chat.id)
+        config = ChatConfig.from_row(chat)
+        useful = {"digest": "в ежедневную сводку", "instant": "сразу в личку", "off": "не присылать"}
+        await message.reply(
+            "<b>Настройки</b>\n"
+            f"Модерация: {on_off(not chat or bool(chat['enabled']))}\n"
+            f"Строгость: {MODE_LABEL[config.mode]}\n"
+            f"Режим тишины: {on_off(config.lockdown)}\n"
+            f"Мут и бан за повторные нарушения: {on_off(config.escalation)}\n"
+            f"Полезные комментарии: {useful[chat['useful_mode'] if chat else 'digest']}\n"
+            f"Ежедневная сводка: {on_off(not chat or bool(chat['digest']))}\n\n"
+            f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам — всегда"
+        )
+
+    async def on_mode(self, message: Message, command: CommandObject) -> None:
+        arg = await self.admin_args(message, command)
+        if arg is None:
+            return
+        if arg not in MODES:
+            await message.reply("Выберите: <code>/mode soft</code>, <code>/mode normal</code> или <code>/mode strict</code>")
+            return
+        await self.storage.set_setting(message.chat.id, "mode", arg)
+        await message.reply(f"Строгость: {MODE_LABEL[arg]}")
+
+    async def _switch(self, message: Message, command: CommandObject, key: str, title: str) -> None:
+        arg = await self.admin_args(message, command)
+        if arg is None:
+            return
+        if arg not in ("on", "off"):
+            await message.reply(f"Напишите <code>/{command.command} on</code> или <code>/{command.command} off</code>")
+            return
+        await self.storage.set_setting(message.chat.id, key, int(arg == "on"))
+        await message.reply(f"{title}: {on_off(arg == 'on')}")
+
+    async def on_lockdown(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "lockdown", "Режим тишины")
+
+    async def on_escalation(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "escalation", "Мут и бан за повторные нарушения")
+
+    async def on_digest(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "digest", "Ежедневная сводка")
+
+    async def on_useful(self, message: Message, command: CommandObject) -> None:
+        arg = await self.admin_args(message, command)
+        if arg is None:
+            return
+        if arg not in ("digest", "instant", "off"):
+            await message.reply("Выберите: <code>/useful digest</code> (в сводку), <code>instant</code> (сразу) или <code>off</code>")
+            return
+        await self.storage.set_setting(message.chat.id, "useful_mode", arg)
+        await message.reply("Готово.")
+
+    async def on_toggle(self, message: Message, command: CommandObject) -> None:
+        if not await self.is_admin_message(message):
+            return
+        enabled = command.command == "on"
+        await self.storage.set_enabled(message.chat.id, enabled)
+        await message.reply("Модерация включена ✅" if enabled else "Модерация выключена ⏸")
+
+    async def on_trust(self, message: Message, command: CommandObject) -> None:
+        if not await self.is_admin_message(message):
+            return
+        target = message.reply_to_message.from_user if message.reply_to_message else None
+        if not target:
+            await message.reply("Ответьте этой командой на сообщение человека.")
+            return
+        trusted = command.command == "trust"
+        await self.storage.set_trusted(message.chat.id, target.id, trusted)
+        name = html.escape(target.full_name)
+        await message.reply(f"{name}: {'больше не проверяю' if trusted else 'снова проверяю'}.")
+
+    async def on_check(self, message: Message, command: CommandObject) -> None:
+        if not await self.is_admin_message(message):
+            return
+        text = (command.args or "").strip()
+        if not text:
+            await message.reply("Напишите текст: <code>/check текст комментария</code>")
+            return
+        user = message.from_user
+        comment = Comment(
+            message.chat.id, message.message_id, text,
+            Author(user.id if user else 0, user.full_name if user else "Админ", previous_messages=3),
+        )
+        try:
+            d = await self.moderator.check(comment, await self.config(message.chat.id))
+        except JevError as e:
+            await message.reply(f"ИИ недоступен: {html.escape(str(e))}")
+            return
+        v = d.verdict
+        lines = [f"Я бы: <b>{DECISION_LABEL[d.action]}</b>"]
+        if v:
+            lines.append(f"Категория: {v.category.value}, уверенность {v.confidence:.0%}, шанс что это бот {v.bot_probability:.0%}")
+        if d.reason:
+            lines.append(f"Причина: {html.escape(d.reason)}")
+        lines.append("(Проверка без последствий: ничего не удалено.)")
+        await message.reply("\n".join(lines))
+
     async def on_stats(self, message: Message) -> None:
         if not await self.is_admin_message(message):
             return
-        s = await self.storage.stats(message.chat.id, int(time.time()) - 24 * 3600)
+        s = await self.storage.stats(message.chat.id, int(time.time()) - DAY)
         checked = sum(v for k, v in s.items() if k != "tokens")
-        deleted = sum(s.get(a.value, 0) for a in (ActionType.DELETE_AND_BAN, ActionType.DELETE_SILENT, ActionType.DELETE_AND_EXPLAIN))
+        deleted = sum(s.get(a.value, 0) for a in DELETING_ACTIONS)
         await message.reply(
             "<b>За сутки</b>\n"
             f"Проверено комментариев: {checked}\n"
@@ -224,18 +406,36 @@ class TelegramAdapter:
             f"Токенов Jev: {s['tokens']}"
         )
 
-    async def on_toggle(self, message: Message, command: CommandObject) -> None:
-        if not await self.is_admin_message(message):
-            return
-        enabled = command.command == "on"
-        await self.storage.set_enabled(message.chat.id, enabled)
-        await message.reply("Модерация включена ✅" if enabled else "Модерация выключена ⏸")
-
     # --------------------------------------------------------------- moderation
 
-    async def on_group_message(self, message: Message) -> None:
+    async def remember_post(self, message: Message) -> None:
         text = message.text or message.caption
-        if not text or not message.from_user or message.is_automatic_forward:
+        if text:
+            await self.storage.add_post(message.chat.id, message.message_id, text)
+
+    async def comment_context(self, message: Message) -> tuple[str | None, str | None]:
+        """Text of the channel post the comment is under, and of the comment it replies to."""
+        chat_id = message.chat.id
+        post = None
+        thread = message.message_thread_id
+        if thread:
+            post = await self.storage.get_post(chat_id, thread)
+        parent = message.reply_to_message
+        reply_to = None
+        if parent:
+            parent_text = parent.text or parent.caption
+            if parent.is_automatic_forward:
+                post = post or parent_text
+            elif parent.message_id != thread:
+                reply_to = parent_text
+        return post, reply_to
+
+    async def on_group_message(self, message: Message) -> None:
+        if message.is_automatic_forward:
+            await self.remember_post(message)
+            return
+        text = message.text or message.caption
+        if not text or not message.from_user:
             return
         if message.sender_chat or message.from_user.is_bot:
             return  # channel posts, anonymous admins, other bots
@@ -243,11 +443,15 @@ class TelegramAdapter:
         chat = await self.storage.get_chat(chat_id)
         if chat and not chat["enabled"]:
             return
-        if await self.is_admin(chat_id, message.from_user.id):
+        user = message.from_user
+        if await self.is_admin(chat_id, user.id) or await self.storage.is_trusted(chat_id, user.id):
             return
 
-        user = message.from_user
         messages, deletions = await self.storage.user_counters(chat_id, user.id)
+        config = ChatConfig.from_row(chat)
+        post_text, reply_to_text = (None, None)
+        if not config.lockdown and not config.blanket:
+            post_text, reply_to_text = await self.comment_context(message)
         comment = Comment(
             chat_id=chat_id,
             message_id=message.message_id,
@@ -260,17 +464,18 @@ class TelegramAdapter:
                 previous_messages=messages,
                 previous_deletions=deletions,
             ),
+            post_text=post_text,
+            reply_to_text=reply_to_text,
         )
-        rules = chat["rules"] if chat else ""
         try:
-            decision = await self.moderator.check(comment, rules)
+            decision = await self.moderator.check(comment, config)
         except JevError as e:
             log.error("Moderation failed, letting the comment through: %s", e)
             return
 
-        deleted = decision.action in (ActionType.DELETE_AND_BAN, ActionType.DELETE_SILENT, ActionType.DELETE_AND_EXPLAIN)
+        deleted = decision.action in DELETING_ACTIONS
         await self.storage.count_message(chat_id, user.id, deleted)
-        if decision.action == ActionType.NONE and decision.verdict is None:
+        if decision.verdict is None:
             return  # skipped without calling Jev
         v = decision.verdict
         log_id = await self.storage.add_log(
@@ -279,12 +484,12 @@ class TelegramAdapter:
             user_id=user.id,
             user_name=user.full_name,
             text=text,
-            category=v.category.value if v else None,
-            confidence=v.confidence if v else None,
-            bot_probability=v.bot_probability if v else None,
+            category=v.category.value,
+            confidence=v.confidence,
+            bot_probability=v.bot_probability,
             action=decision.action.value,
             reason=decision.reason,
-            tokens=v.input_tokens if v else 0,
+            tokens=v.input_tokens,
         )
         log.info("chat=%s user=%s action=%s %s", chat_id, user.id, decision.action.value, v)
         await self.execute(message, decision, log_id, chat)
@@ -292,17 +497,28 @@ class TelegramAdapter:
     async def execute(self, message: Message, decision: Decision, log_id: int, chat) -> None:
         action = decision.action
         owner_id = chat["owner_id"] if chat else None
+        useful_mode = chat["useful_mode"] if chat else "digest"
         user = message.from_user
+        shown = message.text or message.caption
         try:
-            if action in (ActionType.DELETE_AND_BAN, ActionType.DELETE_SILENT, ActionType.DELETE_AND_EXPLAIN):
+            if action in DELETING_ACTIONS:
                 await message.delete()
             if action == ActionType.DELETE_AND_BAN:
                 await self.bot.ban_chat_member(message.chat.id, user.id)
-            elif action == ActionType.DELETE_AND_EXPLAIN:
+            elif action in (ActionType.DELETE_AND_EXPLAIN, ActionType.DELETE_AND_MUTE):
+                hours = decision.extra.get("mute_hours")
+                if hours:
+                    await self.bot.restrict_chat_member(
+                        message.chat.id,
+                        user.id,
+                        permissions=ChatPermissions(can_send_messages=False),
+                        until_date=timedelta(hours=hours),
+                    )
                 mention = f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
+                tail = f" Писать в чате можно будет через {hours} ч." if hours else ""
                 notice = await self.bot.send_message(
                     message.chat.id,
-                    f"{mention}, ваш комментарий удалён: {html.escape(decision.reason)}.",
+                    f"{mention}, ваш комментарий удалён: {html.escape(decision.reason)}.{tail}",
                     reply_to_message_id=message.reply_to_message.message_id if message.reply_to_message else None,
                     reply_markup=kb([("Не согласен — оспорить", f"appeal:{log_id}")]),
                 )
@@ -311,16 +527,16 @@ class TelegramAdapter:
                 v = decision.verdict
                 await self.dm(
                     owner_id,
-                    f"🤔 Не уверен насчёт комментария от {html.escape(user.full_name)} "
+                    f"🤔 Комментарий от {html.escape(user.full_name)} "
                     f"({html.escape(decision.reason)}, уверенность {v.confidence:.0%}):\n"
-                    f"{quote(message.text or message.caption)}\n{message_link(message.chat, message.message_id)}",
+                    f"{quote(shown)}\n{chat_message_link(message.chat.id, message.message_id, message.chat.username)}",
                     kb([("🗑 Удалить", f"rev:del:{log_id}"), ("✅ Оставить", f"rev:keep:{log_id}")]),
                 )
-            elif action == ActionType.FORWARD_USEFUL:
+            elif action == ActionType.FORWARD_USEFUL and useful_mode == "instant":
                 await self.dm(
                     owner_id,
                     f"💡 Полезный комментарий от {html.escape(user.full_name)}:\n"
-                    f"{quote(message.text or message.caption)}\n{message_link(message.chat, message.message_id)}",
+                    f"{quote(shown)}\n{chat_message_link(message.chat.id, message.message_id, message.chat.username)}",
                 )
         except TelegramAPIError as e:
             log.warning("Action %s failed in chat %s: %s", action.value, message.chat.id, e)
@@ -364,12 +580,36 @@ class TelegramAdapter:
             return None
         return entry
 
+    async def _lift_restrictions(self, chat_id: int, user_id: int) -> None:
+        try:
+            await self.bot.restrict_chat_member(
+                chat_id,
+                user_id,
+                permissions=ChatPermissions(
+                    can_send_messages=True,
+                    can_send_audios=True,
+                    can_send_documents=True,
+                    can_send_photos=True,
+                    can_send_videos=True,
+                    can_send_video_notes=True,
+                    can_send_voice_notes=True,
+                    can_send_polls=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True,
+                ),
+            )
+        except TelegramAPIError as e:
+            log.warning("Cannot lift restrictions: %s", e)
+
     async def on_appeal_decision(self, call: CallbackQuery) -> None:
         entry = await self._owner_entry(call)
         if not entry:
             return
         if call.data.startswith("ap:ok"):
             await self.storage.set_feedback(entry["id"], "not_spam")
+            await self.storage.reset_deletions(entry["chat_id"], entry["user_id"])
+            if entry["action"] == ActionType.DELETE_AND_MUTE.value:
+                await self._lift_restrictions(entry["chat_id"], entry["user_id"])
             # A deleted message cannot be restored, so the bot reposts its text.
             try:
                 await self.bot.send_message(
@@ -401,3 +641,56 @@ class TelegramAdapter:
             result = "✅ Оставлено."
         await call.message.edit_text(call.message.html_text + "\n\n" + result)
         await call.answer()
+
+    # ------------------------------------------------------------------- digest
+
+    async def build_digest(self, chat_id: int, since: int) -> str | None:
+        s = await self.storage.stats(chat_id, since)
+        checked = sum(v for k, v in s.items() if k != "tokens")
+        if not checked:
+            return None
+        deleted = sum(s.get(a.value, 0) for a in DELETING_ACTIONS)
+        try:
+            title = html.escape((await self.bot.get_chat(chat_id)).title or "")
+        except TelegramAPIError:
+            title = ""
+        lines = [
+            f"📊 <b>Сводка за сутки</b> {title}".rstrip(),
+            f"Проверено комментариев: {checked}",
+            f"Удалено: {deleted}, из них с баном: {s.get(ActionType.DELETE_AND_BAN.value, 0)}",
+        ]
+        review = s.get(ActionType.SEND_TO_REVIEW.value, 0)
+        if review:
+            lines.append(f"Отправлено вам на проверку: {review}")
+        reasons = await self.storage.top_reasons(chat_id, since)
+        if reasons:
+            lines.append("\n<b>Чаще всего удалял:</b>")
+            lines += [f"• {html.escape(reason)} — {n}" for reason, n in reasons]
+        useful = await self.storage.useful_comments(chat_id, since)
+        if useful:
+            lines.append("\n💡 <b>Полезные комментарии:</b>")
+            for row in useful:
+                snippet = row["text"] if len(row["text"]) <= 200 else row["text"][:200] + "…"
+                link = chat_message_link(chat_id, row["message_id"])
+                lines.append(f"• {html.escape(row['user_name'] or '')}: {html.escape(snippet)}\n{link}")
+        return "\n".join(lines)
+
+    async def send_digests(self, now: datetime | None = None) -> None:
+        now = now or datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        for chat in await self.storage.digest_chats():
+            if chat["digest_last"] == today:
+                continue
+            try:
+                text = await self.build_digest(chat["chat_id"], int(now.timestamp()) - DAY)
+                if text:
+                    await self.dm(chat["owner_id"], text)
+            except Exception:  # one broken chat must not stop the others
+                log.exception("Digest failed for chat %s", chat["chat_id"])
+            await self.storage.mark_digest_sent(chat["chat_id"], today)
+
+    async def digest_loop(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            if datetime.now(timezone.utc).hour == DIGEST_HOUR_UTC:
+                await self.send_digests()

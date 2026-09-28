@@ -1,4 +1,4 @@
-"""SQLite storage: chat settings, moderation log, per-user counters, appeals."""
+"""SQLite storage: chat settings, moderation log, per-user counters, appeals, posts."""
 
 import time
 
@@ -41,9 +41,34 @@ CREATE TABLE IF NOT EXISTS appeals (
     log_id INTEGER NOT NULL,
     ts INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS posts (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    PRIMARY KEY (chat_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS trusted (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+);
 """
 
+# Columns added after the first release: (name, definition). Added to old databases on open.
+CHAT_COLUMNS = [
+    ("rules_json", "TEXT"),
+    ("pending_json", "TEXT"),
+    ("mode", "TEXT NOT NULL DEFAULT 'normal'"),
+    ("lockdown", "INTEGER NOT NULL DEFAULT 0"),
+    ("escalation", "INTEGER NOT NULL DEFAULT 1"),
+    ("digest", "INTEGER NOT NULL DEFAULT 1"),
+    ("useful_mode", "TEXT NOT NULL DEFAULT 'digest'"),
+    ("digest_last", "TEXT"),
+]
+SETTINGS = {name for name, _ in CHAT_COLUMNS} - {"rules_json", "pending_json", "digest_last"} | {"enabled"}
+
 DAY = 24 * 3600
+DELETING = ("delete_and_ban", "delete_and_mute", "delete_silent", "delete_and_explain")
 
 
 class Storage:
@@ -55,6 +80,11 @@ class Storage:
         self.db = await aiosqlite.connect(self.path)
         self.db.row_factory = aiosqlite.Row
         await self.db.executescript(SCHEMA)
+        async with self.db.execute("PRAGMA table_info(chats)") as cur:
+            existing = {row["name"] for row in await cur.fetchall()}
+        for name, definition in CHAT_COLUMNS:
+            if name not in existing:
+                await self.db.execute(f"ALTER TABLE chats ADD COLUMN {name} {definition}")
         await self.db.commit()
 
     async def close(self) -> None:
@@ -71,9 +101,11 @@ class Storage:
         await self.db.execute("INSERT OR IGNORE INTO chats (chat_id) VALUES (?)", (chat_id,))
         await self.db.commit()
 
-    async def set_pending_rules(self, chat_id: int, text: str) -> None:
+    async def set_pending_rules(self, chat_id: int, text: str, rules_json: str) -> None:
         await self.ensure_chat(chat_id)
-        await self.db.execute("UPDATE chats SET pending_rules = ? WHERE chat_id = ?", (text, chat_id))
+        await self.db.execute(
+            "UPDATE chats SET pending_rules = ?, pending_json = ? WHERE chat_id = ?", (text, rules_json, chat_id)
+        )
         await self.db.commit()
 
     async def confirm_rules(self, chat_id: int, owner_id: int) -> bool:
@@ -81,20 +113,28 @@ class Storage:
         if not chat or chat["pending_rules"] is None:
             return False
         await self.db.execute(
-            "UPDATE chats SET rules = pending_rules, pending_rules = NULL, owner_id = ? WHERE chat_id = ?",
+            """UPDATE chats SET rules = pending_rules, rules_json = pending_json,
+               pending_rules = NULL, pending_json = NULL, owner_id = ? WHERE chat_id = ?""",
             (owner_id, chat_id),
         )
         await self.db.commit()
         return True
 
     async def discard_pending_rules(self, chat_id: int) -> None:
-        await self.db.execute("UPDATE chats SET pending_rules = NULL WHERE chat_id = ?", (chat_id,))
+        await self.db.execute(
+            "UPDATE chats SET pending_rules = NULL, pending_json = NULL WHERE chat_id = ?", (chat_id,)
+        )
+        await self.db.commit()
+
+    async def set_setting(self, chat_id: int, key: str, value) -> None:
+        if key not in SETTINGS:
+            raise ValueError(f"unknown setting {key!r}")
+        await self.ensure_chat(chat_id)
+        await self.db.execute(f"UPDATE chats SET {key} = ? WHERE chat_id = ?", (value, chat_id))
         await self.db.commit()
 
     async def set_enabled(self, chat_id: int, enabled: bool) -> None:
-        await self.ensure_chat(chat_id)
-        await self.db.execute("UPDATE chats SET enabled = ? WHERE chat_id = ?", (int(enabled), chat_id))
-        await self.db.commit()
+        await self.set_setting(chat_id, "enabled", int(enabled))
 
     # --- users ---
 
@@ -113,6 +153,43 @@ class Storage:
             (chat_id, user_id, int(deleted)),
         )
         await self.db.commit()
+
+    async def reset_deletions(self, chat_id: int, user_id: int) -> None:
+        await self.db.execute(
+            "UPDATE users SET deletions = MAX(deletions - 1, 0) WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+        )
+        await self.db.commit()
+
+    # --- trusted users ---
+
+    async def set_trusted(self, chat_id: int, user_id: int, trusted: bool) -> None:
+        if trusted:
+            await self.db.execute("INSERT OR IGNORE INTO trusted (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
+        else:
+            await self.db.execute("DELETE FROM trusted WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        await self.db.commit()
+
+    async def is_trusted(self, chat_id: int, user_id: int) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM trusted WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    # --- channel posts (context for comments) ---
+
+    async def add_post(self, chat_id: int, message_id: int, text: str) -> None:
+        await self.db.execute(
+            "INSERT OR REPLACE INTO posts (chat_id, message_id, text) VALUES (?, ?, ?)",
+            (chat_id, message_id, text[:1500]),
+        )
+        await self.db.commit()
+
+    async def get_post(self, chat_id: int, message_id: int) -> str | None:
+        async with self.db.execute(
+            "SELECT text FROM posts WHERE chat_id = ? AND message_id = ?", (chat_id, message_id)
+        ) as cur:
+            row = await cur.fetchone()
+        return row["text"] if row else None
 
     # --- log ---
 
@@ -141,6 +218,34 @@ class Storage:
         result = {row["action"]: row["n"] for row in rows}
         result["tokens"] = sum(row["t"] or 0 for row in rows)
         return result
+
+    async def top_reasons(self, chat_id: int, since: int, limit: int = 3) -> list[tuple[str, int]]:
+        marks = ", ".join("?" for _ in DELETING)
+        async with self.db.execute(
+            f"""SELECT reason, COUNT(*) AS n FROM log
+                WHERE chat_id = ? AND ts >= ? AND action IN ({marks}) AND reason != ''
+                GROUP BY reason ORDER BY n DESC LIMIT ?""",
+            (chat_id, since, *DELETING, limit),
+        ) as cur:
+            return [(row["reason"], row["n"]) for row in await cur.fetchall()]
+
+    async def useful_comments(self, chat_id: int, since: int, limit: int = 5) -> list[aiosqlite.Row]:
+        async with self.db.execute(
+            """SELECT * FROM log WHERE chat_id = ? AND ts >= ? AND action = 'forward_useful'
+               ORDER BY confidence DESC, id DESC LIMIT ?""",
+            (chat_id, since, limit),
+        ) as cur:
+            return await cur.fetchall()
+
+    async def digest_chats(self) -> list[aiosqlite.Row]:
+        async with self.db.execute(
+            "SELECT * FROM chats WHERE digest = 1 AND owner_id IS NOT NULL AND enabled = 1"
+        ) as cur:
+            return await cur.fetchall()
+
+    async def mark_digest_sent(self, chat_id: int, day: str) -> None:
+        await self.db.execute("UPDATE chats SET digest_last = ? WHERE chat_id = ?", (day, chat_id))
+        await self.db.commit()
 
     # --- appeals ---
 

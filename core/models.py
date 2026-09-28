@@ -22,6 +22,9 @@ class Comment:
     text: str
     author: Author
     platform: str = "telegram"
+    # Context the rules may refer to: "не по теме поста", "оскорбляет собеседника".
+    post_text: str | None = None
+    reply_to_text: str | None = None
 
 
 class Category(str, Enum):
@@ -36,7 +39,7 @@ class Verdict:
     category: Category
     confidence: float
     bot_probability: float
-    # Index into the channel's rule list, or None when no rule applies.
+    # Index into the prohibitions list of the chat config, or None when no rule applies.
     rule_index: int | None = None
     input_tokens: int = 0
 
@@ -44,10 +47,19 @@ class Verdict:
 class ActionType(str, Enum):
     NONE = "none"
     DELETE_AND_BAN = "delete_and_ban"  # obvious spam bot: silent
+    DELETE_AND_MUTE = "delete_and_mute"  # repeat offender or rule says "mute"
     DELETE_SILENT = "delete_silent"  # violation, author looks like a bot or unsure
     DELETE_AND_EXPLAIN = "delete_and_explain"  # violation by a real person
     SEND_TO_REVIEW = "send_to_review"  # model is not sure: ask the admin
     FORWARD_USEFUL = "forward_useful"  # useful comment: show to the owner
+
+
+DELETING_ACTIONS = (
+    ActionType.DELETE_AND_BAN,
+    ActionType.DELETE_AND_MUTE,
+    ActionType.DELETE_SILENT,
+    ActionType.DELETE_AND_EXPLAIN,
+)
 
 
 @dataclass

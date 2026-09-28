@@ -24,11 +24,13 @@ async def main() -> None:
     jev = JevClient(os.environ["TYPESAFE_API_KEY"], model=os.getenv("JEV_MODEL", "jev-latest"))
     bot = Bot(os.environ["TELEGRAM_BOT_TOKEN"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     adapter = TelegramAdapter(bot, Moderator(jev), storage)
+    digest_task = asyncio.create_task(adapter.digest_loop())
     try:
         await adapter.dispatcher().start_polling(
             bot, allowed_updates=["message", "callback_query", "my_chat_member"]
         )
     finally:
+        digest_task.cancel()
         await jev.close()
         await storage.close()
         await bot.session.close()
