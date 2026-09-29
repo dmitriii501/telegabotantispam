@@ -32,6 +32,7 @@ async def main() -> None:
             adapter, os.environ["TELEGRAM_BOT_TOKEN"], os.getenv("WEBAPP_HOST", "127.0.0.1"), int(os.getenv("WEBAPP_PORT", "8080"))
         )
         await adapter.set_menu_button()
+    await adapter.set_commands()
     try:
         await adapter.dispatcher().start_polling(
             bot, allowed_updates=["message", "edited_message", "callback_query", "my_chat_member"]

@@ -28,7 +28,7 @@ const KINDS = {
   prohibition: ["❌", "Запрет"],
   permission: ["✅", "Разрешено"],
   context: ["ℹ️", "Описание канала"],
-  everything: ["🚫", "Ко всем комментариям"],
+  everything: ["🚫", "Все комментарии без разбора"],
 };
 const MODE_HINT = {
   soft: "Почти всё сомнительное бот присылает вам.",
@@ -61,11 +61,16 @@ function toast(text) {
 }
 
 async function api(method, path, body) {
-  const res = await fetch("/api" + path, {
-    method,
-    headers: { "X-Init-Data": tg ? tg.initData : "", "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  let res;
+  try {
+    res = await fetch("/api" + path, {
+      method,
+      headers: { "X-Init-Data": tg ? tg.initData : "", "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (_) {
+    throw new Error("Нет связи с сервером. Проверьте интернет и попробуйте ещё раз.");
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "Ошибка " + res.status);
   return data;
@@ -236,13 +241,13 @@ function renderRules() {
           <textarea class="txt" rows="1" maxlength="300" data-i="${i}">${esc(r.text)}</textarea>
           <button class="del" data-del="${i}" title="Удалить правило">✕</button></div>
         <div class="row"><select data-kind="${i}">${kinds}</select>${acts}</div>
-        ${acts ? `<div class="tag" id="hint-${i}">${esc(ACTION_HINT[r.action || "auto"])}</div>` : ""}</div>`;
+        ${acts ? `<div class="tag" id="hint-${i}">${esc(hintFor(r))}</div>` : ""}</div>`;
     })
     .join("");
   $("#view").innerHTML = `
     <div class="h">Правила чата</div>
     <div id="ruleList">${cards || '<p class="empty">Правил пока нет. Добавьте первое или вставьте текстом.</p>'}</div>
-    <div class="card base"><span>🛡</span><span>Спам, казино, наркотики и мошенничество удаляются всегда. Это правило нельзя отключить.</span></div>
+    <div class="card base"><span>🛡</span><span>Спам, казино, наркотики и мошенничество запрещены всегда. Это правило нельзя отключить.</span></div>
     <button class="btn ghost wide" id="add">＋ Добавить правило</button>
     <div class="h">Или вставьте текстом</div>
     <textarea class="paste" id="paste" maxlength="2000" placeholder="Например: рекламу нельзя — бан, политику — удалять"></textarea>
@@ -266,7 +271,7 @@ function renderRules() {
       renderRules();
     } else if (t.act !== undefined) {
       state.rules[t.act].action = e.target.value === "auto" ? null : e.target.value;
-      $(`#hint-${t.act}`).textContent = ACTION_HINT[e.target.value];
+      $(`#hint-${t.act}`).textContent = hintFor(state.rules[t.act]);
       setDirty(true);
     }
   };
@@ -293,6 +298,12 @@ function renderRules() {
   $("#parse").onclick = parseText;
 }
 
+function hintFor(rule) {
+  if (rule.kind === "everything")
+    return (rule.action ? ACTION_HINT[rule.action] : "Удалит сообщение молча.") + " Действует на все комментарии без разбора.";
+  return ACTION_HINT[rule.action || "auto"];
+}
+
 function autoGrow(el) {
   el.style.height = "auto";
   el.style.height = el.scrollHeight + "px";
@@ -309,7 +320,7 @@ async function parseText() {
     state.rules.push(...res.rules);
     setDirty(true);
     renderRules();
-    toast("Добавил " + res.rules.length + ". Проверьте действия и сохраните");
+    toast("Добавлено правил: " + res.rules.length + ". Проверьте действия и нажмите «Сохранить»");
   } catch (e) {
     toast(e.message);
     btn.disabled = false;
@@ -396,15 +407,15 @@ function renderSettings() {
     <div class="card">
       ${toggle("enabled", "Модерация", "Выключите, чтобы бот временно ничего не проверял")}
       ${toggle("observe", "Пробный режим", "Бот ничего не удаляет, только записывает, что сделал бы. Итог в /report")}
+      ${toggle("escalation", "Мут и бан за повторы", "3-е нарушение за 30 дней — мут на сутки, 5-е — бан")}
       ${toggle("antiflood", "Антифлуд", "Мут за много сообщений подряд. Пороги ниже настраиваются")}
       ${floodFields()}
-      ${toggle("analytics", "Аналитика комментариев", "Тип, тон и «ждёт ответа» для каждого комментария")}
-      ${toggle("lockdown", "Удалять всё от участников", "Временная мера при рейде: удаляются все сообщения не-админов")}
-      ${toggle("escalation", "Мут и бан за повторы", "3-е нарушение — мут на сутки, 5-е — бан")}
       ${toggle("conflicts", "Предупреждать о ссорах", "Сообщу вам, если обсуждение накаляется")}
+      ${toggle("analytics", "Аналитика комментариев", "Тип, тон и «ждёт ответа» для каждого комментария")}
       ${toggle("digest", "Ежедневная сводка", "Каждый день в 09:00 по Москве")}
+      ${toggle("lockdown", "Удалять всё от участников", "Временная мера при рейде: удаляются все сообщения не-админов")}
     </div>
-    <div class="h">Полезные комментарии</div>
+    <div class="h">Полезные комментарии: куда присылать</div>
     <div class="card">${segmented("useful_mode", [["digest", "В сводку"], ["instant", "Сразу"], ["off", "Не нужно"]])}</div>
     <div class="h">Не проверять</div>
     <div class="card">${trusted || '<div class="tag">Никого. Добавить можно командой /trust ответом на сообщение или в журнале.</div>'}</div>`;
@@ -517,7 +528,7 @@ async function renderLog() {
 function entryCard(e) {
   const [label, tone] = ACTION_PILL[e.action] || [e.action, ""];
   const when = new Date(e.ts * 1000).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-  const conf = e.confidence == null ? "" : ` · ${Math.round(e.confidence * 100)}%`;
+  const conf = e.confidence == null ? "" : ` · бот уверен на ${Math.round(e.confidence * 100)}%`;
   let acts = "";
   let status = "";
   const dryRun = e.executed === false && e.action !== "send_to_review";
@@ -532,9 +543,9 @@ function entryCard(e) {
     acts = `<div class="acts"><button class="btn ghost" data-restore="${e.id}">↩️ Вернуть</button>
       <button class="btn ghost" data-trust="${e.id}">⭐ Доверять</button></div>`;
   return `<div class="card entry">
-    <div class="who"><span>${esc(e.user_name || "Без имени")} · ${esc(when)}</span><span class="pill ${tone}">${esc(label + conf)}</span></div>
+    <div class="who"><span>${esc(e.user_name || "Без имени")} · ${esc(when)}</span><span class="pill ${tone}">${esc(label)}</span></div>
     <blockquote>${esc(e.text)}</blockquote>
-    <span class="tag">${esc(e.reason || "")}</span> ${status}${acts}</div>`;
+    <span class="tag">${esc((e.reason || "") + conf)}</span> ${status}${acts}</div>`;
 }
 
 function drawLog() {

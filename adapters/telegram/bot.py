@@ -17,6 +17,9 @@ from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllPrivateChats,
     CallbackQuery,
     ChatMemberUpdated,
     ChatPermissions,
@@ -84,40 +87,62 @@ DECISION_LABEL = {
     ActionType.FORWARD_USEFUL: "переслал бы вам как полезный",
 }
 MODE_LABEL = {
-    "soft": "мягкий: сомнительное присылаю вам",
-    "normal": "обычный",
-    "strict": "строгий: удаляю при меньшей уверенности",
+    "soft": "мягкий: почти всё сомнительное присылаю вам",
+    "normal": "обычный: уверенное удаляю, сомнительное присылаю вам",
+    "strict": "строгий: удаляю смелее, вам присылаю реже",
 }
+CATEGORY_LABEL = {"spam": "спам", "rule_violation": "нарушение правил", "useful": "полезный", "normal": "обычный"}
+KIND_SINGLE = {
+    "question": "вопрос",
+    "complaint": "жалоба",
+    "praise": "похвала",
+    "suggestion": "предложение",
+    "bug": "ошибка в посте",
+    "chat": "общение",
+}
+USEFUL_LABEL = {
+    "digest": "полезные комментарии пойдут в ежедневную сводку",
+    "instant": "полезные комментарии буду присылать сразу",
+    "off": "полезные комментарии присылать не буду",
+}
+JEV_PRICE_PER_MTOK = 0.042  # dollars per million input tokens
+NOT_ADMIN = "я не админ"
+RIGHTS_TEXT = (
+    "Чтобы модерировать, сделайте меня админом группы с правами «Удалять сообщения» "
+    "и «Блокировать пользователей»."
+)
 
 HELP_TEXT = (
-    "Я модерирую комментарии с помощью ИИ: понимаю смысл, а не ищу стоп-слова, "
-    "поэтому ловлю рекламу, замаскированную латиницей и цифрами.\n\n"
+    "Я слежу за комментариями под постами: убираю спам и рекламу (в том числе замаскированную), "
+    "нарушения ваших правил и подсказываю, кому вы не ответили.\n\n"
     "<b>Как подключить</b>\n"
     "1. Добавьте меня в группу обсуждений канала (или в обычную группу).\n"
-    "2. Сделайте меня админом с правами удалять сообщения и банить.\n"
+    "2. Сделайте меня админом с правами «Удалять сообщения» и «Блокировать пользователей».\n"
     "3. Напишите в группе правила обычным языком, можно сразу с действиями:\n"
     "<code>/rules Канал про крипту. Мат можно. Рекламу нельзя — бан. "
     "Политику — просто удалять. Оскорбления — предупреждать.</code>\n"
-    "4. Подтвердите, что я правильно понял.\n\n"
-    "Спам я удаляю всегда, даже без правил. Спорные комментарии, апелляции и сводки "
-    "присылаю в личку тому, кто подтвердил правила, поэтому напишите мне /start.\n\n"
+    "4. Подтвердите, что я понял правильно.\n\n"
+    "Новый чат начинается в <b>пробном режиме</b>: я ничего не удаляю, а записываю, что сделал бы "
+    "(итог: /report). Когда результат устроит, включите настоящую модерацию: /observe off.\n\n"
+    "Проще всего всё настраивать в <b>панели</b>: /panel. Спорные комментарии, апелляции и сводки "
+    "я присылаю в личку тому, кто подтвердил правила, поэтому напишите мне /start.\n\n"
     "<b>Команды в группе (только для админов)</b>\n"
+    "/panel — панель: правила, настройки, журнал, аналитика\n"
     "/rules [текст] — задать или показать правила\n"
-    "/settings — все настройки\n"
-    "/mode soft|normal|strict — строгость\n"
-    "/lockdown on|off — удалять всё от участников (на время рейда)\n"
-    "/escalation on|off — мут и бан за повторные нарушения\n"
-    "/useful digest|instant|off — полезные комментарии: в сводку, сразу или никак\n"
-    "/digest on|off — ежедневная сводка\n"
-    "/conflicts on|off — предупреждать, когда обсуждение накаляется\n"
-    "/observe on|off — пробный режим: ничего не удалять, только записывать\n"
+    "/settings — все настройки одним сообщением\n"
     "/report — отчёт за 7 дней\n"
-    "/antiflood [5 10 60|off] — мут за флуд: сообщений, секунд, минут мута (или показать настройку)\n"
-    "/analytics on|off — типы и тон комментариев\n"
-    "/check текст — что бы я сделал с таким комментарием\n"
+    "/check текст — что бы я сделал с таким комментарием (ничего не удаляя)\n"
+    "/observe on|off — пробный режим: ничего не удалять, только записывать\n"
+    "/mode soft|normal|strict — строгость: soft чаще спрашивает вас, strict удаляет смелее\n"
+    "/lockdown on|off — удалять всё от участников (на время рейда)\n"
+    "/escalation on|off — мут на сутки за 3-е нарушение и бан за 5-е (за 30 дней)\n"
+    "/antiflood [5 10 60|off] — мут за флуд: сообщений, секунд, минут мута; без чисел покажет настройку\n"
+    "/conflicts on|off — предупреждать, когда обсуждение накаляется\n"
+    "/analytics on|off — типы и тон комментариев, «ждёт ответа»\n"
+    "/useful digest|instant|off — полезные комментарии: в сводку, сразу или не присылать\n"
+    "/digest on|off — ежедневная сводка\n"
     "/trust, /untrust — ответом на сообщение: не проверять этого человека\n"
-    "/panel — веб-панель: правила, настройки, журнал\n"
-    "/stats — статистика за сутки, /off и /on — пауза"
+    "/off и /on — поставить модерацию на паузу и вернуть"
 )
 
 
@@ -248,7 +273,7 @@ class TelegramAdapter:
         if now - self._notified.get(ck, 0) < cooldown:
             return
         self._notified[ck] = now
-        await self.dm(owner_id, text)
+        await self.dm(owner_id, f"{text}\n\nЧат: «{html.escape(await self.chat_title(chat['chat_id']))}»")
 
     async def linked_channel(self, chat_id: int) -> int | None:
         """The channel this discussion group belongs to (its own comments are never moderated)."""
@@ -269,7 +294,7 @@ class TelegramAdapter:
     async def check_rights(self, chat_id: int) -> list[str]:
         me = await self.bot.get_chat_member(chat_id, self.bot.id)
         if me.status != ChatMemberStatus.ADMINISTRATOR:
-            return ["я не админ"]
+            return [NOT_ADMIN]
         missing = []
         if not getattr(me, "can_delete_messages", False):
             missing.append("удалять сообщения")
@@ -334,6 +359,7 @@ class TelegramAdapter:
         r.message(Command("analytics"), GROUPS)(self.on_analytics)
         r.message(Command("report"), GROUPS)(self.on_report)
         r.message(Command("panel"))(self.on_panel)
+        r.message(Command("help"))(self.on_help)
         r.message(Command("off", "on"), GROUPS)(self.on_toggle)
         r.callback_query(F.data.startswith("rules:"))(self.on_rules_button)
         r.callback_query(F.data.startswith("appeal:"))(self.on_appeal)
@@ -344,6 +370,28 @@ class TelegramAdapter:
 
     async def on_start(self, message: Message) -> None:
         await message.answer(HELP_TEXT, reply_markup=self.panel_markup())
+
+    async def on_help(self, message: Message) -> None:
+        await message.answer(HELP_TEXT, reply_markup=self.panel_markup() if message.chat.type == ChatType.PRIVATE else None)
+
+    async def set_commands(self) -> None:
+        """The "/" menu in Telegram: short lists, so people find the commands without reading the manual."""
+        private = [BotCommand(command="start", description="Как подключить бота"),
+                   BotCommand(command="panel", description="Панель управления")]
+        admins = [
+            BotCommand(command="panel", description="Панель: правила, настройки, журнал"),
+            BotCommand(command="rules", description="Правила чата"),
+            BotCommand(command="settings", description="Все настройки"),
+            BotCommand(command="report", description="Отчёт за 7 дней"),
+            BotCommand(command="check", description="Проверить текст комментария"),
+            BotCommand(command="observe", description="Пробный режим: вкл или выкл"),
+            BotCommand(command="help", description="Все команды"),
+        ]
+        try:
+            await self.bot.set_my_commands(private, scope=BotCommandScopeAllPrivateChats())
+            await self.bot.set_my_commands(admins, scope=BotCommandScopeAllChatAdministrators())
+        except TelegramAPIError as e:
+            log.warning("Cannot set the command menu: %s", e)
 
     async def on_panel(self, message: Message) -> None:
         if not self.webapp_url:
@@ -368,14 +416,17 @@ class TelegramAdapter:
         if created:
             await self.storage.set_setting(event.chat.id, "observe", 1)
         missing = await self.check_rights(event.chat.id)
-        if missing:
-            text = "Привет! Чтобы модерировать, мне нужны права админа: " + ", ".join(missing) + "."
+        if missing == [NOT_ADMIN]:
+            text = "Привет! " + RIGHTS_TEXT
+        elif missing:
+            text = "Привет! Мне не хватает прав: " + ", ".join(missing) + ". Включите их в настройках админа."
         elif created:
             text = (
                 "Готов к работе. Первые дни я в <b>пробном режиме</b>: ничего не удаляю, а записываю, "
                 "что сделал бы. Через несколько дней <code>/report</code> покажет результат, "
                 "<code>/observe off</code> включит настоящую модерацию.\n"
-                "Задайте правила обычным языком: <code>/rules мат можно, рекламу нельзя — бан</code>"
+                "Задайте правила обычным языком: <code>/rules мат можно, рекламу нельзя — бан</code>\n"
+                "Или откройте панель: /panel"
             )
         else:
             text = (
@@ -396,7 +447,7 @@ class TelegramAdapter:
         if not command.args:
             config = await self.config(chat_id)
             await message.reply(
-                f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам — всегда\n\n"
+                f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам и мошенничество — всегда запрещены\n\n"
                 "Изменить: <code>/rules текст</code>"
             )
             return
@@ -412,9 +463,9 @@ class TelegramAdapter:
             return
         await self.storage.set_pending_rules(chat_id, text, rules_to_json(rules))
         await message.reply(
-            f"Понял так:\n{describe_rules(rules)}\n❌ спам — всегда\n\n"
-            "Если в правиле не названо действие, решаю сам: человеку объясняю, бота убираю молча. "
-            "Всё верно?",
+            f"Понял так:\n{describe_rules(rules)}\n❌ спам и мошенничество — всегда запрещены\n\n"
+            "Если в правиле не названо действие, решаю сам: спам-бота баню, человеку объясняю, "
+            "если не уверен — спрашиваю вас. Всё верно?",
             reply_markup=kb([("✅ Всё верно", f"rules:ok:{chat_id}"), ("✏️ Исправить", f"rules:no:{chat_id}")]),
         )
 
@@ -458,7 +509,7 @@ class TelegramAdapter:
             f"Антифлуд: {describe_antiflood(config)}\n"
             f"Аналитика комментариев: {on_off(config.analytics)}\n"
             f"Пробный режим (ничего не удаляю): {on_off(config.observe)}\n\n"
-            f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам — всегда"
+            f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам и мошенничество — всегда запрещены"
         )
 
     async def on_mode(self, message: Message, command: CommandObject) -> None:
@@ -542,7 +593,7 @@ class TelegramAdapter:
             await message.reply("Выберите: <code>/useful digest</code> (в сводку), <code>instant</code> (сразу) или <code>off</code>")
             return
         await self.storage.set_setting(message.chat.id, "useful_mode", arg)
-        await message.reply("Готово.")
+        await message.reply(f"Готово: {USEFUL_LABEL[arg]}.")
 
     async def on_toggle(self, message: Message, command: CommandObject) -> None:
         if not await self.is_admin_message(message):
@@ -583,7 +634,16 @@ class TelegramAdapter:
         v = d.verdict
         lines = [f"Я бы: <b>{DECISION_LABEL[d.action]}</b>"]
         if v:
-            lines.append(f"Категория: {v.category.value}, уверенность {v.confidence:.0%}, шанс что это бот {v.bot_probability:.0%}")
+            lines.append(
+                f"Оценка: {CATEGORY_LABEL[v.category.value]}. Бот уверен на {v.confidence:.0%}, "
+                f"шанс, что писал бот-спамер: {v.bot_probability:.0%}"
+            )
+            if v.kind:
+                lines.append(f"Тип комментария: {KIND_SINGLE[v.kind]}")
+            if v.lead >= 0.6:
+                lines.append("🛒 Похоже на клиента: хочет купить или узнать цену")
+            if v.needs_answer >= 0.6:
+                lines.append("📨 Автор ждёт ответа")
         if d.reason:
             lines.append(f"Причина: {html.escape(d.reason)}")
         lines.append("(Проверка без последствий: ничего не удалено.)")
@@ -601,7 +661,7 @@ class TelegramAdapter:
             f"Удалено: {deleted} (из них с баном: {s.get(ActionType.DELETE_AND_BAN.value, 0)})\n"
             f"Отправлено вам на проверку: {s.get(ActionType.SEND_TO_REVIEW.value, 0)}\n"
             f"Полезных: {s.get(ActionType.FORWARD_USEFUL.value, 0)}\n"
-            f"Токенов Jev: {s['tokens']}"
+            f"Расход ИИ: около ${s['tokens'] / 1e6 * JEV_PRICE_PER_MTOK:.2f}"
         )
 
     # --------------------------------------------------------------- moderation
@@ -867,17 +927,20 @@ class TelegramAdapter:
                 self.spawn(self.delete_later(message.chat.id, notice.message_id, EXPLANATION_TTL))
             elif action == ActionType.SEND_TO_REVIEW:
                 v = decision.verdict
+                title = html.escape(await self.chat_title(message.chat.id))
                 await self.dm(
                     owner_id,
-                    f"🤔 Комментарий от {html.escape(name)} "
-                    f"({html.escape(decision.reason)}, уверенность {v.confidence:.0%}):\n"
+                    f"🤔 Не уверен насчёт комментария в чате «{title}»\n"
+                    f"Автор: {html.escape(name)}. Причина: {html.escape(decision.reason)}. "
+                    f"Бот уверен на {v.confidence:.0%}:\n"
                     f"{quote(shown)}\n{chat_message_link(message.chat.id, message.message_id, message.chat.username)}",
                     kb([("🗑 Удалить", f"rev:del:{log_id}"), ("✅ Оставить", f"rev:keep:{log_id}")]),
                 )
             elif action == ActionType.FORWARD_USEFUL and useful_mode == "instant":
+                title = html.escape(await self.chat_title(message.chat.id))
                 await self.dm(
                     owner_id,
-                    f"💡 Полезный комментарий от {html.escape(name)}:\n"
+                    f"💡 Полезный комментарий в чате «{title}» от {html.escape(name)}:\n"
                     f"{quote(shown)}\n{chat_message_link(message.chat.id, message.message_id, message.chat.username)}",
                 )
             return True
@@ -910,7 +973,8 @@ class TelegramAdapter:
         chat = await self.storage.get_chat(entry["chat_id"])
         sent = await self.dm(
             chat["owner_id"] if chat else None,
-            f"⚖️ {html.escape(entry['user_name'] or '')} оспаривает удаление "
+            f"⚖️ {html.escape(entry['user_name'] or '')} оспаривает удаление в чате "
+            f"«{html.escape(await self.chat_title(entry['chat_id']))}» "
             f"({html.escape(entry['reason'] or '')}):\n{quote(entry['text'])}",
             kb([("↩️ Вернуть комментарий", f"ap:ok:{log_id}"), ("🗑 Удаление верное", f"ap:no:{log_id}")]),
         )
