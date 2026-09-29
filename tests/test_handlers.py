@@ -224,7 +224,7 @@ async def test_observe_mode_records_but_changes_nothing(env):
     # nothing is remembered as removed either, so the real run later judges it afresh
     assert await env.storage.example_kind(CHAT, "x") is None
     text = await adapter.build_digest(CHAT, 0, observe=True, period="за 7 дней")
-    assert "режима наблюдения" in text and "Удалил бы: 1" in text
+    assert "пробного режима" in text and "Удалил бы: 1" in text
 
 
 async def test_new_chats_start_in_observe_mode_existing_ones_do_not(env):

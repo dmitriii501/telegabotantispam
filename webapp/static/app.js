@@ -185,7 +185,7 @@ function renderApp() {
     <header>
       <h1>${esc(chatTitle())}</h1>
       <div class="sub"><span class="dot ${s.enabled ? "" : "off"}"></span>
-        ${!s.enabled ? "Модерация выключена" : s.observe ? "Режим наблюдения: ничего не удаляю" : "Модерация включена"}
+        ${!s.enabled ? "Модерация выключена" : s.observe ? "Пробный режим: бот ничего не удаляет" : "Модерация включена"}
         ${state.chats.length > 1 ? '<span>·</span><button class="link" id="switch">сменить чат</button>' : ""}</div>
     </header>
     <nav id="tabs">
@@ -395,11 +395,11 @@ function renderSettings() {
     <div class="h">Поведение</div>
     <div class="card">
       ${toggle("enabled", "Модерация", "Выключите, чтобы бот временно ничего не проверял")}
-      ${toggle("observe", "Режим наблюдения", "Бот ничего не удаляет, только записывает, что сделал бы. Итог в /report")}
+      ${toggle("observe", "Пробный режим", "Бот ничего не удаляет, только записывает, что сделал бы. Итог в /report")}
       ${toggle("antiflood", "Антифлуд", "Мут за много сообщений подряд. Пороги ниже настраиваются")}
       ${floodFields()}
       ${toggle("analytics", "Аналитика комментариев", "Тип, тон и «ждёт ответа» для каждого комментария")}
-      ${toggle("lockdown", "Режим тишины", "Удалять все сообщения не-админов")}
+      ${toggle("lockdown", "Удалять всё от участников", "Временная мера при рейде: удаляются все сообщения не-админов")}
       ${toggle("escalation", "Мут и бан за повторы", "3-е нарушение — мут на сутки, 5-е — бан")}
       ${toggle("conflicts", "Предупреждать о ссорах", "Сообщу вам, если обсуждение накаляется")}
       ${toggle("digest", "Ежедневная сводка", "Каждый день в 09:00 по Москве")}
@@ -421,9 +421,9 @@ function renderSettings() {
       const on = e.target.checked;
       const warning =
         key === "lockdown" && on
-          ? "Включить режим тишины? Бот начнёт удалять все сообщения не-админов."
+          ? "Включить удаление всех сообщений участников? Пока это включено, бот удаляет всё, что пишут не-админы."
           : key === "observe" && !on
-            ? "Выключить режим наблюдения? Бот начнёт по-настоящему удалять сообщения."
+            ? "Выключить пробный режим? Бот начнёт по-настоящему удалять сообщения."
             : key === "enabled" && !on
               ? "Выключить модерацию? Бот перестанет проверять комментарии."
               : null;
@@ -521,7 +521,7 @@ function entryCard(e) {
   let acts = "";
   let status = "";
   const dryRun = e.executed === false && e.action !== "send_to_review";
-  if (dryRun) status = '<span class="pill">наблюдение: не удалено</span>';
+  if (dryRun) status = '<span class="pill">пробный режим: не удалено</span>';
   else if (e.feedback === "not_spam") status = '<span class="pill good">решено: оставлено</span>';
   else if (e.feedback === "confirmed") status = '<span class="pill">решено: удалено</span>';
   else if (dryRun) acts = "";

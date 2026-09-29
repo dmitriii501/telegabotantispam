@@ -105,12 +105,12 @@ HELP_TEXT = (
     "/rules [текст] — задать или показать правила\n"
     "/settings — все настройки\n"
     "/mode soft|normal|strict — строгость\n"
-    "/lockdown on|off — режим тишины: удалять всё от не-админов\n"
+    "/lockdown on|off — удалять всё от участников (на время рейда)\n"
     "/escalation on|off — мут и бан за повторные нарушения\n"
     "/useful digest|instant|off — полезные комментарии: в сводку, сразу или никак\n"
     "/digest on|off — ежедневная сводка\n"
     "/conflicts on|off — предупреждать, когда обсуждение накаляется\n"
-    "/observe on|off — режим наблюдения: ничего не удалять, только записывать\n"
+    "/observe on|off — пробный режим: ничего не удалять, только записывать\n"
     "/report — отчёт за 7 дней\n"
     "/antiflood [5 10 60|off] — мут за флуд: сообщений, секунд, минут мута (или показать настройку)\n"
     "/analytics on|off — типы и тон комментариев\n"
@@ -372,7 +372,7 @@ class TelegramAdapter:
             text = "Привет! Чтобы модерировать, мне нужны права админа: " + ", ".join(missing) + "."
         elif created:
             text = (
-                "Готов к работе. Первые дни я в <b>режиме наблюдения</b>: ничего не удаляю, а записываю, "
+                "Готов к работе. Первые дни я в <b>пробном режиме</b>: ничего не удаляю, а записываю, "
                 "что сделал бы. Через несколько дней <code>/report</code> покажет результат, "
                 "<code>/observe off</code> включит настоящую модерацию.\n"
                 "Задайте правила обычным языком: <code>/rules мат можно, рекламу нельзя — бан</code>"
@@ -450,14 +450,14 @@ class TelegramAdapter:
             "<b>Настройки</b>\n"
             f"Модерация: {on_off(not chat or bool(chat['enabled']))}\n"
             f"Строгость: {MODE_LABEL[config.mode]}\n"
-            f"Режим тишины: {on_off(config.lockdown)}\n"
+            f"Удалять всё от участников: {on_off(config.lockdown)}\n"
             f"Мут и бан за повторные нарушения: {on_off(config.escalation)}\n"
             f"Полезные комментарии: {useful[chat['useful_mode'] if chat else 'digest']}\n"
             f"Ежедневная сводка: {on_off(not chat or bool(chat['digest']))}\n"
             f"Предупреждения о ссорах: {on_off(config.conflicts)}\n"
             f"Антифлуд: {describe_antiflood(config)}\n"
             f"Аналитика комментариев: {on_off(config.analytics)}\n"
-            f"Режим наблюдения (ничего не удаляю): {on_off(config.observe)}\n\n"
+            f"Пробный режим (ничего не удаляю): {on_off(config.observe)}\n\n"
             f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам — всегда"
         )
 
@@ -482,7 +482,7 @@ class TelegramAdapter:
         await message.reply(f"{title}: {on_off(arg == 'on')}")
 
     async def on_lockdown(self, message: Message, command: CommandObject) -> None:
-        await self._switch(message, command, "lockdown", "Режим тишины")
+        await self._switch(message, command, "lockdown", "Удалять всё от участников")
 
     async def on_escalation(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "escalation", "Мут и бан за повторные нарушения")
@@ -491,7 +491,7 @@ class TelegramAdapter:
         await self._switch(message, command, "conflicts", "Предупреждения о ссорах")
 
     async def on_observe(self, message: Message, command: CommandObject) -> None:
-        await self._switch(message, command, "observe", "Режим наблюдения")
+        await self._switch(message, command, "observe", "Пробный режим")
 
     async def on_antiflood(self, message: Message, command: CommandObject) -> None:
         """/antiflood — show; /antiflood on|off; /antiflood 5 10 60 — 5 messages in 10 s → mute for 60 min."""
@@ -825,7 +825,7 @@ class TelegramAdapter:
                 owner_id,
                 f"🔥 Разгорается конфликт{where}: {len(recent)} сообщений от {people} участников за "
                 f"{CONFLICT_WINDOW // 60} минут, тон резкий.\n{link}\n\n"
-                "Если нужно остановить, включите режим тишины: /lockdown on",
+                "Если нужно остановить, включите удаление всех сообщений участников: /lockdown on",
             )
         except Exception:  # background task: never let it crash the handler
             log.exception("Conflict check failed")
@@ -1022,7 +1022,7 @@ class TelegramAdapter:
             title = ""
         if observe:
             lines = [
-                f"🔎 <b>Отчёт режима наблюдения {period}</b> {title}".rstrip(),
+                f"🔎 <b>Отчёт пробного режима {period}</b> {title}".rstrip(),
                 "Ничего не удалялось: бот записывал, что сделал бы.",
                 f"Проверено комментариев: {checked}",
                 f"Удалил бы: {deleted}, из них забанил бы: {bans}",

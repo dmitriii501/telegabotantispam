@@ -380,7 +380,7 @@ class Moderator:
     @staticmethod
     def _blanket(config: ChatConfig) -> Decision:
         if config.lockdown:
-            return _blanket_decision(None, "включён режим тишины")
+            return _blanket_decision(None, "сейчас удаляются все сообщения участников")
         return _blanket_decision(config.blanket, f"правило «{config.blanket.text.rstrip('.!; ')}»")
 
     @staticmethod
