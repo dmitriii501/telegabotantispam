@@ -192,6 +192,11 @@ class Storage:
         )
         await self.db.commit()
 
+    async def claim_owner(self, chat_id: int, user_id: int) -> None:
+        """The first admin to use the bot in a chat becomes the one who gets its private messages."""
+        await self.db.execute("UPDATE chats SET owner_id = ? WHERE chat_id = ? AND owner_id IS NULL", (user_id, chat_id))
+        await self.db.commit()
+
     async def set_enabled(self, chat_id: int, enabled: bool) -> None:
         await self.set_setting(chat_id, "enabled", int(enabled))
 

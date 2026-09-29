@@ -50,6 +50,9 @@ CONFLICT_MIN_MESSAGES = 6
 CONFLICT_RECHECK = 5 * 60
 CONFLICT_COOLDOWN = 60 * 60  # do not warn about the same thread twice in an hour
 THREAD_BUFFER = 30
+# Trial mode is silent by nature, so the owner gets a few live examples to see that the bot works.
+TRIAL_NOTICES_PER_DAY = 5
+TRIAL_ADMIN_TESTS_PER_DAY = 20
 AUTO_REMEMBER_CONFIDENCE = 0.95  # bans this sure are remembered, so copies of the spam skip Jev
 
 # Antiflood defaults; every chat can change them. The limits keep the settings sane.
@@ -123,7 +126,9 @@ HELP_TEXT = (
     "Политику — просто удалять. Оскорбления — предупреждать.</code>\n"
     "4. Подтвердите, что я понял правильно.\n\n"
     "Новый чат начинается в <b>пробном режиме</b>: я ничего не удаляю, а записываю, что сделал бы "
-    "(итог: /report). Когда результат устроит, включите настоящую модерацию: /observe off.\n\n"
+    "(итог: /report). Первые находки я пришлю вам в личку с кнопками «Верно» и «Ошибка». "
+    "Чтобы проверить меня самому, напишите в чат тестовую рекламу: я отвечу, что сделал бы. "
+    "Когда результат устроит, включите настоящую модерацию: /observe off.\n\n"
     "Проще всего всё настраивать в <b>панели</b>: /panel. Спорные комментарии, апелляции и сводки "
     "я присылаю в личку тому, кто подтвердил правила, поэтому напишите мне /start.\n\n"
     "<b>Команды в группе (только для админов)</b>\n"
@@ -218,6 +223,7 @@ class TelegramAdapter:
         self._notified: dict[tuple[int, str], float] = {}
         self._linked: dict[int, int | None] = {}
         self._tasks: set[asyncio.Task] = set()  # strong references: a bare create_task can be garbage collected
+        self._trial: dict[tuple[int, str], deque] = {}
         self._purged_day = ""
         self.webapp_url = os.getenv("WEBAPP_URL", "").rstrip("/")
         self.router = Router()
@@ -245,7 +251,21 @@ class TelegramAdapter:
         # Anonymous admins post on behalf of the group itself.
         if message.sender_chat and message.sender_chat.id == message.chat.id:
             return True
-        return bool(message.from_user) and await self.is_admin(message.chat.id, message.from_user.id)
+        if not message.from_user or not await self.is_admin(message.chat.id, message.from_user.id):
+            return False
+        await self.storage.claim_owner(message.chat.id, message.from_user.id)
+        return True
+
+    def trial_slot(self, chat_id: int, kind: str, limit: int) -> int | None:
+        """Use one of today's `limit` trial-mode messages; returns how many are left, None when none were."""
+        now = time.time()
+        stamps = self._trial.setdefault((chat_id, kind), deque())
+        while stamps and now - stamps[0] > DAY:
+            stamps.popleft()
+        if len(stamps) >= limit:
+            return None
+        stamps.append(now)
+        return limit - len(stamps)
 
     async def dm(self, user_id: int | None, text: str, markup: InlineKeyboardMarkup | None = None) -> bool:
         if not user_id:
@@ -365,6 +385,7 @@ class TelegramAdapter:
         r.callback_query(F.data.startswith("appeal:"))(self.on_appeal)
         r.callback_query(F.data.startswith("ap:"))(self.on_appeal_decision)
         r.callback_query(F.data.startswith("rev:"))(self.on_review_decision)
+        r.callback_query(F.data.startswith("obs:"))(self.on_trial_verdict)
         r.message(GROUPS)(self.on_group_message)
         r.edited_message(GROUPS)(self.on_edited_message)
 
@@ -425,6 +446,8 @@ class TelegramAdapter:
                 "Готов к работе. Первые дни я в <b>пробном режиме</b>: ничего не удаляю, а записываю, "
                 "что сделал бы. Через несколько дней <code>/report</code> покажет результат, "
                 "<code>/observe off</code> включит настоящую модерацию.\n"
+                "Проверить меня можно сразу: напишите в чат тестовое рекламное сообщение, и я отвечу, "
+                "что сделал бы.\n"
                 "Задайте правила обычным языком: <code>/rules мат можно, рекламу нельзя — бан</code>\n"
                 "Или откройте панель: /panel"
             )
@@ -738,6 +761,7 @@ class TelegramAdapter:
             # channel are fine; any other channel is a stranger and is moderated like a person.
             if sender.id == chat_id:
                 await self.note_admin_reply(message, edited)
+                await self.trial_test(message, chat, edited)
                 return
             if sender.id == await self.linked_channel(chat_id):
                 return
@@ -745,6 +769,7 @@ class TelegramAdapter:
         elif user and not user.is_bot:
             if await self.is_admin(chat_id, user.id):
                 await self.note_admin_reply(message, edited)
+                await self.trial_test(message, chat, edited)
                 return
             author_id, author_name, username, premium = user.id, user.full_name, user.username, bool(user.is_premium)
         else:
@@ -823,11 +848,79 @@ class TelegramAdapter:
         log.info("chat=%s author=%s action=%s edited=%s %s", chat_id, author_id, decision.action.value, edited, v)
         if config.observe:
             await self.storage.set_executed(log_id, False)  # a dry run: recorded, not carried out
+            if decision.action in DELETING_ACTIONS:
+                await self.trial_notice(message, decision, log_id, chat, author_name)
             return
         if key and decision.action == ActionType.DELETE_AND_BAN and v.confidence >= AUTO_REMEMBER_CONFIDENCE:
             await self.storage.add_example(chat_id, key, "remove")
         if not await self.execute(message, decision, log_id, chat):
             await self.storage.set_executed(log_id, False)
+
+    async def trial_notice(self, message: Message, decision: Decision, log_id: int, chat, name: str) -> None:
+        """Trial mode: show the owner the first few things the bot would remove, with a verdict button."""
+        owner_id = chat["owner_id"] if chat else None
+        left = self.trial_slot(message.chat.id, "owner", TRIAL_NOTICES_PER_DAY) if owner_id else None
+        if left is None:
+            return
+        title = html.escape(await self.chat_title(message.chat.id))
+        text = (
+            f"🔎 <b>Пробный режим</b>, чат «{title}»: я {DECISION_LABEL[decision.action]} комментарий от "
+            f"{html.escape(name)}.\nПричина: {html.escape(decision.reason)}.\n"
+            f"{quote(message.text or message.caption)}\n"
+            f"{chat_message_link(message.chat.id, message.message_id, message.chat.username)}"
+        )
+        if left == 0:
+            text += "\n\nЭто последняя подсказка на сегодня, остальное покажет /report."
+        await self.dm(owner_id, text, kb([("✅ Верно", f"obs:ok:{log_id}"), ("↩️ Ошибка, это нормально", f"obs:no:{log_id}")]))
+
+    async def trial_test(self, message: Message, chat, edited: bool) -> None:
+        """Trial mode: an admin's own message is checked as if a member wrote it, so the bot can be tested by hand.
+
+        Nothing is recorded and nothing is deleted; the answer goes to the admin privately (or briefly into the chat).
+        """
+        text = message.text or message.caption
+        if edited or not chat or not chat["observe"] or not text or text.startswith("/"):
+            return
+        chat_id = message.chat.id
+        if self.trial_slot(chat_id, "admin", TRIAL_ADMIN_TESTS_PER_DAY) is None:
+            return
+        user = message.from_user
+        anonymous = bool(message.sender_chat)
+        comment = Comment(
+            chat_id, message.message_id, text,
+            Author(user.id if user and not anonymous else 0, "Тест", previous_messages=1),
+            links=self.extract_links(message),
+        )
+        try:
+            decision = await self.moderator.check(comment, ChatConfig.from_row(chat))
+        except JevError:
+            return
+        if decision.action in (ActionType.NONE, ActionType.FORWARD_USEFUL):
+            return
+        answer = (
+            f"🔎 <b>Пробный режим:</b> если бы это написал участник, я {DECISION_LABEL[decision.action]}.\n"
+            f"Причина: {html.escape(decision.reason)}."
+        )
+        target = chat["owner_id"] if anonymous else user.id
+        if await self.dm(target, answer):
+            return
+        try:  # the admin has not started the bot: answer in the chat and tidy up soon
+            note = await message.reply(answer)
+            self.spawn(self.delete_later(chat_id, note.message_id, EXPLANATION_TTL))
+        except TelegramAPIError as e:
+            log.info("Trial answer not delivered: %s", e)
+
+    async def on_trial_verdict(self, call: CallbackQuery) -> None:
+        entry = await self._owner_entry(call)
+        if not entry:
+            return
+        right = call.data.startswith("obs:ok")
+        await self.storage.set_feedback(entry["id"], "confirmed" if right else "not_spam")
+        await call.message.edit_text(
+            call.message.html_text
+            + ("\n\n✅ Записал: бот прав." if right else "\n\n↩️ Записал: бот ошибся, такие комментарии буду пропускать.")
+        )
+        await call.answer()
 
     async def note_admin_reply(self, message: Message, edited: bool) -> None:
         """An admin answered a comment: it stops counting as unanswered."""
