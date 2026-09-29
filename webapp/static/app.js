@@ -62,15 +62,81 @@ async function api(method, path, body) {
   return data;
 }
 
+// ------------------------------------------------- native Telegram controls (with fallbacks)
+
+const nativeMain = () => !!(tg && tg.MainButton && tg.MainButton.setText);
+const nativeBack = () => !!(tg && tg.BackButton && tg.BackButton.show);
+
+function haptic(kind) {
+  try {
+    if (!tg || !tg.HapticFeedback) return;
+    if (["success", "error", "warning"].includes(kind)) tg.HapticFeedback.notificationOccurred(kind);
+    else tg.HapticFeedback.impactOccurred(kind || "light");
+  } catch (_) {
+    /* older clients: no vibration */
+  }
+}
+
+function confirmAction(text, onYes, onNo) {
+  const done = (ok) => (ok ? onYes() : onNo && onNo());
+  if (tg && tg.showConfirm && tg.isVersionAtLeast && tg.isVersionAtLeast("6.2")) tg.showConfirm(text, done);
+  else done(window.confirm(text));
+}
+
+function fail(e) {
+  toast(e.message);
+  haptic("error");
+}
+
+function setBusy(busy) {
+  $("#save").disabled = busy;
+  if (!nativeMain()) return;
+  if (busy) tg.MainButton.showProgress(false);
+  else tg.MainButton.hideProgress();
+}
+
 function setDirty(value) {
   state.dirty = value;
-  $("#savebar").hidden = !(value && state.tab === "rules");
+  const show = value && state.tab === "rules";
+  if (nativeMain()) {
+    // The big button at the bottom of Telegram itself replaces our own bar.
+    if (show) {
+      tg.MainButton.setText("Сохранить правила");
+      tg.MainButton.show();
+    } else tg.MainButton.hide();
+    $("#savebar").hidden = true;
+  } else $("#savebar").hidden = !show;
+  try {
+    // Telegram asks "close without saving?" while edits are pending.
+    if (value) tg.enableClosingConfirmation();
+    else tg.disableClosingConfirmation();
+  } catch (_) {
+    /* not supported */
+  }
+}
+
+function updateBack() {
+  if (!nativeBack()) return;
+  if (state.chatId !== null && state.chats.length > 1) tg.BackButton.show();
+  else tg.BackButton.hide();
+}
+
+function goBack() {
+  const leave = () => {
+    state.chatId = null;
+    setDirty(false);
+    renderPicker();
+  };
+  if (state.dirty) confirmAction("Несохранённые правки пропадут. Выйти?", leave);
+  else leave();
 }
 
 // ------------------------------------------------------------------ chat picker
 
 function renderPicker() {
+  state.chatId = null;
   setDirty(false);
+  updateBack();
   const items = state.chats
     .map(
       (c) => `<div class="card set"><div>${esc(c.title)}<small>${c.enabled ? "модерация включена" : "модерация выключена"}</small></div>
@@ -89,7 +155,7 @@ async function openChat(chatId) {
     state.chatId = chatId;
     state.data = await api("GET", "/chat/" + chatId);
   } catch (e) {
-    toast(e.message);
+    fail(e);
     return;
   }
   state.rules = state.data.rules.map((r) => ({ ...r }));
@@ -104,6 +170,7 @@ function chatTitle() {
 }
 
 function renderApp() {
+  updateBack();
   const s = state.data.settings;
   $("#app").innerHTML = `
     <header>
@@ -119,7 +186,7 @@ function renderApp() {
     </nav>
     <section id="view"></section>`;
   const sw = $("#switch");
-  if (sw) sw.onclick = () => (setDirty(false), renderPicker());
+  if (sw) sw.onclick = goBack;
   $("#tabs").querySelectorAll("button").forEach((b) => (b.onclick = () => switchTab(b.dataset.t)));
   renderTab();
 }
@@ -194,9 +261,16 @@ function renderRules() {
   };
   list.onclick = (e) => {
     if (e.target.dataset.del === undefined) return;
-    state.rules.splice(Number(e.target.dataset.del), 1);
-    setDirty(true);
-    renderRules();
+    const index = Number(e.target.dataset.del);
+    const remove = () => {
+      state.rules.splice(index, 1);
+      haptic("medium");
+      setDirty(true);
+      renderRules();
+    };
+    const text = state.rules[index].text.trim();
+    if (text) confirmAction(`Удалить правило «${text.slice(0, 80)}»?`, remove);
+    else remove();
   };
   $("#add").onclick = () => {
     state.rules.push({ kind: "prohibition", text: "", action: null });
@@ -234,18 +308,18 @@ async function parseText() {
 
 async function saveRules() {
   const rules = state.rules.map((r) => ({ ...r, text: r.text.trim() })).filter((r) => r.text);
-  const btn = $("#save");
-  btn.disabled = true;
+  setBusy(true);
   try {
     await api("PUT", `/chat/${state.chatId}/rules`, { rules });
     state.rules = rules;
     setDirty(false);
     toast("Правила сохранены ✅");
+    haptic("success");
     renderTab();
   } catch (e) {
-    toast(e.message);
+    fail(e);
   } finally {
-    btn.disabled = false;
+    setBusy(false);
   }
 }
 
@@ -258,9 +332,10 @@ async function saveSetting(key, value) {
   try {
     await api("PUT", `/chat/${state.chatId}/settings`, { [key]: value });
     toast("Сохранено ✅");
+    haptic("light");
   } catch (e) {
     s[key] = old;
-    toast(e.message);
+    fail(e);
   }
   renderApp();
 }
@@ -330,7 +405,20 @@ function renderSettings() {
     if (t.dataset.untrust) untrust(Number(t.dataset.untrust));
   };
   view.onchange = (e) => {
-    if (e.target.dataset.set) saveSetting(e.target.dataset.set, e.target.checked);
+    if (e.target.dataset.set) {
+      const key = e.target.dataset.set;
+      const on = e.target.checked;
+      const warning =
+        key === "lockdown" && on
+          ? "Включить режим тишины? Бот начнёт удалять все сообщения не-админов."
+          : key === "observe" && !on
+            ? "Выключить режим наблюдения? Бот начнёт по-настоящему удалять сообщения."
+            : key === "enabled" && !on
+              ? "Выключить модерацию? Бот перестанет проверять комментарии."
+              : null;
+      if (warning) confirmAction(warning, () => saveSetting(key, on), renderSettings);
+      else saveSetting(key, on);
+    }
     if (e.target.dataset.int) {
       const [, , low, high] = FLOOD_FIELDS.find((f) => f[0] === e.target.dataset.int);
       const value = Math.min(high, Math.max(low, parseInt(e.target.value, 10) || low));
@@ -484,6 +572,8 @@ async function start() {
   tg.ready();
   tg.expand();
   $("#save").onclick = saveRules;
+  if (nativeMain()) tg.MainButton.onClick(saveRules);
+  if (nativeBack()) tg.BackButton.onClick(goBack);
   try {
     state.chats = (await api("GET", "/chats")).chats;
   } catch (e) {
