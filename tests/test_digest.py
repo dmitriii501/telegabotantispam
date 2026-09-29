@@ -68,5 +68,5 @@ def test_describe_rules():
     ])
     assert "✅ Мат можно" in text
     assert "❌ Рекламу нельзя — бан — удалять и банить" in text
-    assert "по ситуации" in text
+    assert "автоматически" in text and "спрошу вас" in text
     assert "все комментарии" in text

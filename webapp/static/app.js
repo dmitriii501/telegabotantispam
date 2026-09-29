@@ -10,10 +10,19 @@ const esc = (s) =>
 const ACTIONS = {
   ban: "Бан",
   mute: "Мут на сутки",
-  warn: "С предупреждением",
+  warn: "Предупредить",
   delete: "Просто удалить",
   review: "Прислать мне",
-  auto: "По ситуации",
+  auto: "Авто (рекомендуется)",
+};
+// What the chosen action does, in plain words: shown under the selector of every rule.
+const ACTION_HINT = {
+  auto: "Спам-бота забанит, человеку объяснит причину, если не уверен — спросит вас.",
+  ban: "Удалит сообщение и забанит автора.",
+  mute: "Удалит сообщение и запретит автору писать 24 часа.",
+  warn: "Удалит сообщение и объяснит автору, что нарушено.",
+  delete: "Удалит сообщение молча.",
+  review: "Ничего не удалит: пришлёт вам на решение.",
 };
 const KINDS = {
   prohibition: ["❌", "Запрет"],
@@ -226,7 +235,8 @@ function renderRules() {
         <div class="top"><span class="icon">${KINDS[r.kind][0]}</span>
           <textarea class="txt" rows="1" maxlength="300" data-i="${i}">${esc(r.text)}</textarea>
           <button class="del" data-del="${i}" title="Удалить правило">✕</button></div>
-        <div class="row"><select data-kind="${i}">${kinds}</select>${acts}</div></div>`;
+        <div class="row"><select data-kind="${i}">${kinds}</select>${acts}</div>
+        ${acts ? `<div class="tag" id="hint-${i}">${esc(ACTION_HINT[r.action || "auto"])}</div>` : ""}</div>`;
     })
     .join("");
   $("#view").innerHTML = `
@@ -256,6 +266,7 @@ function renderRules() {
       renderRules();
     } else if (t.act !== undefined) {
       state.rules[t.act].action = e.target.value === "auto" ? null : e.target.value;
+      $(`#hint-${t.act}`).textContent = ACTION_HINT[e.target.value];
       setDirty(true);
     }
   };
