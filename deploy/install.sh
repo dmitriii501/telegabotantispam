@@ -12,7 +12,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 apt-get update -q
-apt-get install -y -q python3 python3-venv python3-pip rsync
+apt-get install -y -q python3 python3-venv python3-pip rsync tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng
 
 id -u defenceai >/dev/null 2>&1 || useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin defenceai
 

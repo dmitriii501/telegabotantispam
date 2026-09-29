@@ -33,7 +33,7 @@ INT_SETTINGS = {"flood_messages": (3, 30), "flood_window": (5, 120), "flood_mute
 INT_LABELS = {"flood_messages": "Сообщений подряд", "flood_window": "Секунд", "flood_mute": "Минут мута"}
 BOOL_SETTINGS = (
     "lockdown", "escalation", "digest", "enabled", "conflicts", "antiflood", "analytics", "observe",
-    "profile_check", "captcha",
+    "profile_check", "captcha", "clean_service", "antiraid", "first_strict", "image_ocr",
 )
 DELETING = {a.value for a in DELETING_ACTIONS}
 
@@ -146,6 +146,10 @@ def chat_payload(chat, trusted) -> dict:
             "observe": config.observe,
             "profile_check": config.profile_check,
             "captcha": config.captcha,
+            "clean_service": config.clean_service,
+            "antiraid": config.antiraid,
+            "first_strict": config.first_strict,
+            "image_ocr": config.image_ocr,
             "digest": bool(chat["digest"]),
             "useful_mode": chat["useful_mode"],
             "enabled": bool(chat["enabled"]),
@@ -212,7 +216,10 @@ async def put_settings(request: web.Request) -> web.Response:
             raise ApiError(400, f"Некорректная настройка: {key}")
     storage = request.app["adapter"].storage
     for key, value in updates.items():
-        await storage.set_setting(chat["chat_id"], key, value)
+        if key == "lockdown":
+            await storage.set_lockdown(chat["chat_id"], bool(value))  # a manual switch has no end time
+        else:
+            await storage.set_setting(chat["chat_id"], key, value)
     return web.json_response({"ok": True})
 
 
@@ -240,6 +247,21 @@ async def put_links(request: web.Request) -> web.Response:
     blocked = clean_entries(data["blocked"], "Запрещённые") if "blocked" in data else config.blocked_domains
     await request.app["adapter"].storage.set_links(chat["chat_id"], mode, allowed, blocked)
     return web.json_response({"ok": True, "allowed": allowed, "blocked": blocked})
+
+
+async def copy_settings(request: web.Request) -> web.Response:
+    """Replace this chat's rules and settings with those of another chat the same person administers."""
+    chat = await admin_chat(request, fresh=True)
+    data = await read_json(request)
+    source = data.get("from")
+    if not isinstance(source, int) or isinstance(source, bool) or source == chat["chat_id"]:
+        raise ApiError(400, "Выберите другой чат")
+    adapter = request.app["adapter"]
+    if not await adapter.is_admin(source, request["user"]["id"], fresh=True):
+        raise ApiError(403, "Нет доступа к выбранному чату")
+    if not await adapter.storage.copy_settings(source, chat["chat_id"]):
+        raise ApiError(404, "В выбранном чате нет настроек")
+    return web.json_response({"ok": True})
 
 
 async def parse_text(request: web.Request) -> web.Response:
@@ -378,6 +400,7 @@ def create_app(adapter, bot_token: str) -> web.Application:
     app.router.add_put("/api/chat/{chat_id}/rules", put_rules)
     app.router.add_put("/api/chat/{chat_id}/settings", put_settings)
     app.router.add_put("/api/chat/{chat_id}/links", put_links)
+    app.router.add_post("/api/chat/{chat_id}/copy", copy_settings)
     app.router.add_post("/api/chat/{chat_id}/parse", parse_text)
     app.router.add_get("/api/chat/{chat_id}/log", get_log)
     app.router.add_get("/api/chat/{chat_id}/insights", get_insights)

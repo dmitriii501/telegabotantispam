@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS posts (
     chat_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
     text TEXT NOT NULL,
+    ts INTEGER,
     PRIMARY KEY (chat_id, message_id)
 );
 CREATE TABLE IF NOT EXISTS examples (
@@ -83,6 +84,11 @@ CREATE TABLE IF NOT EXISTS verified (
     user_id INTEGER NOT NULL,
     ts INTEGER NOT NULL,
     PRIMARY KEY (chat_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS ocr_cache (
+    file_unique_id TEXT PRIMARY KEY,
+    text TEXT NOT NULL,
+    ts INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS trusted (
     chat_id INTEGER NOT NULL,
@@ -114,6 +120,11 @@ CHAT_COLUMNS = [
     ("blocked_domains", "TEXT NOT NULL DEFAULT '[]'"),
     ("profile_check", "INTEGER NOT NULL DEFAULT 1"),
     ("captcha", "INTEGER NOT NULL DEFAULT 0"),
+    ("clean_service", "INTEGER NOT NULL DEFAULT 0"),
+    ("antiraid", "INTEGER NOT NULL DEFAULT 1"),
+    ("lockdown_until", "INTEGER"),
+    ("first_strict", "INTEGER NOT NULL DEFAULT 1"),
+    ("image_ocr", "INTEGER NOT NULL DEFAULT 1"),
 ]
 LOG_COLUMNS = [
     ("executed", "INTEGER NOT NULL DEFAULT 1"),
@@ -126,10 +137,15 @@ LOG_COLUMNS = [
 ]
 SETTINGS = (
     {name for name, _ in CHAT_COLUMNS}
-    - {"rules_json", "pending_json", "digest_last", "allowed_domains", "blocked_domains"}
+    - {"rules_json", "pending_json", "digest_last", "allowed_domains", "blocked_domains", "lockdown_until"}
     | {"enabled"}
 )
 
+COPIED_SETTINGS = (
+    "mode", "escalation", "digest", "useful_mode", "conflicts", "antiflood", "analytics", "flood_messages",
+    "flood_window", "flood_mute", "links_mode", "allowed_domains", "blocked_domains", "profile_check", "captcha",
+    "clean_service", "antiraid", "first_strict", "image_ocr",
+)
 DAY = 24 * 3600
 DELETION_WINDOW_DAYS = 30
 DELETING = ("delete_and_ban", "delete_and_mute", "delete_silent", "delete_and_explain")
@@ -150,6 +166,7 @@ class Storage:
         await self._add_missing_columns("chats", CHAT_COLUMNS)
         await self._add_missing_columns("log", LOG_COLUMNS)
         await self._add_missing_columns("trusted", [("name", "TEXT NOT NULL DEFAULT ''")])
+        await self._add_missing_columns("posts", [("ts", "INTEGER")])
         await self.db.commit()
 
     async def _add_missing_columns(self, table: str, columns: list[tuple[str, str]]) -> None:
@@ -223,6 +240,29 @@ class Storage:
     async def claim_owner(self, chat_id: int, user_id: int) -> None:
         """The first admin to use the bot in a chat becomes the one who gets its private messages."""
         await self.db.execute("UPDATE chats SET owner_id = ? WHERE chat_id = ? AND owner_id IS NULL", (user_id, chat_id))
+        await self.db.commit()
+
+    async def copy_settings(self, source: int, target: int) -> bool:
+        """Copy the rules and settings of one chat to another. The owner, trusted people, decisions made
+        so far and the chat's own on/off, trial and freeze states stay as they are."""
+        src = await self.get_chat(source)
+        if src is None:
+            return False
+        await self.ensure_chat(target)
+        columns = ["rules", "rules_json", *COPIED_SETTINGS]
+        await self.db.execute(
+            f"UPDATE chats SET {', '.join(f'{c} = ?' for c in columns)} WHERE chat_id = ?",
+            (*(src[c] for c in columns), target),
+        )
+        await self.db.commit()
+        return True
+
+    async def set_lockdown(self, chat_id: int, on: bool, until: int | None = None) -> None:
+        """"Delete everything from members" switch; `until` (unix time) makes it end by itself."""
+        await self.ensure_chat(chat_id)
+        await self.db.execute(
+            "UPDATE chats SET lockdown = ?, lockdown_until = ? WHERE chat_id = ?", (int(on), until if on else None, chat_id)
+        )
         await self.db.commit()
 
     async def set_links(self, chat_id: int, mode: str, allowed: list[str], blocked: list[str]) -> None:
@@ -325,6 +365,21 @@ class Storage:
             await self.db.execute("DELETE FROM avatar_bans WHERE hash = ?", (h,))
         await self.db.commit()
 
+    # --- text read from pictures, remembered per file so every picture is read once ---
+
+    async def get_ocr(self, file_unique_id: str) -> str | None:
+        """The remembered text ("" means the picture was read and has none), or None if never read."""
+        async with self.db.execute("SELECT text FROM ocr_cache WHERE file_unique_id = ?", (file_unique_id,)) as cur:
+            row = await cur.fetchone()
+        return row["text"] if row else None
+
+    async def save_ocr(self, file_unique_id: str, text: str) -> None:
+        await self.db.execute(
+            "INSERT OR REPLACE INTO ocr_cache (file_unique_id, text, ts) VALUES (?, ?, ?)",
+            (file_unique_id, text, int(time.time())),
+        )
+        await self.db.commit()
+
     # --- "I am human" checks passed ---
 
     async def set_verified(self, chat_id: int, user_id: int) -> None:
@@ -341,12 +396,19 @@ class Storage:
 
     # --- channel posts (context for comments) ---
 
-    async def add_post(self, chat_id: int, message_id: int, text: str) -> None:
+    async def add_post(self, chat_id: int, message_id: int, text: str, ts: int | None = None) -> None:
         await self.db.execute(
-            "INSERT OR REPLACE INTO posts (chat_id, message_id, text) VALUES (?, ?, ?)",
-            (chat_id, message_id, text[:1500]),
+            "INSERT OR REPLACE INTO posts (chat_id, message_id, text, ts) VALUES (?, ?, ?, ?)",
+            (chat_id, message_id, text[:1500], ts),
         )
         await self.db.commit()
+
+    async def get_post_ts(self, chat_id: int, message_id: int) -> int | None:
+        async with self.db.execute(
+            "SELECT ts FROM posts WHERE chat_id = ? AND message_id = ?", (chat_id, message_id)
+        ) as cur:
+            row = await cur.fetchone()
+        return row["ts"] if row else None
 
     async def get_post(self, chat_id: int, message_id: int) -> str | None:
         async with self.db.execute(
@@ -483,6 +545,7 @@ class Storage:
         cur = await self.db.execute("DELETE FROM log WHERE ts < ?", (cutoff,))
         await self.db.execute("DELETE FROM appeals WHERE ts < ?", (cutoff,))
         await self.db.execute("DELETE FROM profiles WHERE fetched_at < ?", (cutoff,))
+        await self.db.execute("DELETE FROM ocr_cache WHERE ts < ?", (cutoff,))
         await self.db.commit()
         return cur.rowcount
 

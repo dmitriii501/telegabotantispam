@@ -35,6 +35,7 @@ from core.avatar import dhash
 from core.jev_client import JevError
 from core.links import MAX_ENTRIES, normalize_entry
 from core.models import DELETING_ACTIONS, ActionType, Author, Comment, Decision, Profile
+from core.ocr import OcrEngine
 from core.moderation import (
     MODES,
     NEWCOMER_MESSAGES,
@@ -67,6 +68,19 @@ CAPTCHA_PICTURES = [
     ("🍎", "яблоко"), ("🐱", "кота"), ("🚗", "машину"), ("⭐", "звезду"),
     ("🌵", "кактус"), ("🎈", "шар"), ("🍕", "пиццу"), ("🐟", "рыбу"),
 ]
+# Raid: many people joining within a minute.
+RAID_JOINS = 8
+RAID_WINDOW = 60
+RAID_COOLDOWN = 600  # one alert per ten minutes
+RAID_FREEZE_MINUTES = 30
+SERVICE_KINDS = {
+    "new_chat_members", "left_chat_member", "new_chat_title", "new_chat_photo", "delete_chat_photo",
+    "pinned_message", "video_chat_started", "video_chat_ended", "video_chat_scheduled",
+    "video_chat_participants_invited", "message_auto_delete_timer_changed", "forum_topic_created",
+    "forum_topic_closed", "forum_topic_reopened", "migrate_to_chat_id", "migrate_from_chat_id",
+}
+CLEANABLE_SERVICE = SERVICE_KINDS - {"migrate_to_chat_id", "migrate_from_chat_id", "forum_topic_created"}
+OCR_TIMEOUT = 15.0  # seconds a newcomer's picture may wait for its text
 PROFILE_TTL = 3 * 24 * 3600  # how long a fetched profile is reused
 PROFILE_TIMEOUT = 4.0  # seconds a newcomer's first message may wait for the profile lookup
 
@@ -170,6 +184,9 @@ HELP_TEXT = (
     "/observe on|off — пробный режим: ничего не удалять, только записывать\n"
     "/mode soft|normal|strict — строгость: soft чаще спрашивает вас, strict удаляет смелее\n"
     "/links [ai|block|newcomers] — ссылки: /allowlink, /blocklink, /unlink адрес — списки сайтов и каналов\n"
+    "/firststrict on|off — новички, написавшие в первые 2 минуты после поста (так боты занимают первое место), проверяются строже\n"
+    "/antiraid on|off — предупреждать о массовых заходах; /cleanservice on|off — убирать «вошёл» и «вышел»\n"
+    "/ocr on|off — читать текст на картинках и стикерах новичков (рекламу в виде картинки)\n"
     "/captcha on|off — новичок после первого сообщения нажимает нужную кнопку, иначе сообщение удаляется и мут на сутки\n"
     "/profilecheck on|off — проверять профиль новичков; /profile ответом на сообщение покажет, что бот видит\n"
     "/lockdown on|off — удалять всё от участников (на время рейда)\n"
@@ -271,7 +288,8 @@ def on_off(value: bool) -> str:
 
 
 class TelegramAdapter:
-    def __init__(self, bot: Bot, moderator: Moderator, storage: Storage):
+    def __init__(self, bot: Bot, moderator: Moderator, storage: Storage, ocr: OcrEngine | None = None):
+        self.ocr = ocr if ocr is not None else OcrEngine()
         self.bot = bot
         self.moderator = moderator
         self.storage = storage
@@ -285,6 +303,8 @@ class TelegramAdapter:
         self._linked: dict[int, int | None] = {}
         self._tasks: set[asyncio.Task] = set()  # strong references: a bare create_task can be garbage collected
         self._trial: dict[tuple[int, str], deque] = {}
+        self._joins: dict[int, deque] = {}
+        self._raid_alerted: dict[int, float] = {}
         self._captcha: dict[tuple[int, int], dict] = {}  # open checks: (chat, user) -> answer, messages
         self._purged_day = ""
         self.webapp_url = os.getenv("WEBAPP_URL", "").rstrip("/")
@@ -317,6 +337,49 @@ class TelegramAdapter:
             return False
         await self.storage.claim_owner(message.chat.id, message.from_user.id)
         return True
+
+    @staticmethod
+    def image_source(message: Message) -> tuple[str, str] | None:
+        """(file_id, file_unique_id) of a picture worth reading: a photo, a still sticker or a preview frame."""
+        kind = getattr(message.content_type, "value", message.content_type)
+        if kind == "photo" and message.photo:
+            biggest = message.photo[-1]
+            return biggest.file_id, biggest.file_unique_id
+        if kind == "sticker" and message.sticker:
+            sticker = message.sticker
+            still = not (sticker.is_animated or sticker.is_video)
+            picture = sticker if still else sticker.thumbnail
+            return (picture.file_id, picture.file_unique_id) if picture else None
+        if kind == "animation" and message.animation and message.animation.thumbnail:
+            thumb = message.animation.thumbnail
+            return thumb.file_id, thumb.file_unique_id
+        return None
+
+    async def read_image_text(self, message: Message) -> str | None:
+        """Text found on the message's picture. Every picture is read once: the result is remembered by file."""
+        source = self.image_source(message)
+        if not source:
+            return None
+        file_id, unique_id = source
+        try:
+            cached = await self.storage.get_ocr(unique_id)
+            if cached is not None:
+                return cached or None
+            data = await self.bot.download(file_id)
+            text = await asyncio.wait_for(self.ocr.read(data.getvalue()), OCR_TIMEOUT)
+        except Exception as e:  # a picture we cannot read is simply treated as having no text
+            log.info("ocr: cannot read %s: %s", unique_id, e)
+            return None
+        await self.storage.save_ocr(unique_id, text)
+        return text or None
+
+    @staticmethod
+    def shown_text(message: Message, decision: Decision) -> str | None:
+        text = message.text or message.caption
+        image_text = decision.extra.get("image_text")
+        if text or not image_text:
+            return text
+        return f"{media_label(message) or '[картинка]'} с надписью: {image_text[:400]}"
 
     async def _load_profile(self, user_id: int):
         """Ask Telegram for the bio and the picture and store what came. Failures only mean "unknown"."""
@@ -487,6 +550,10 @@ class TelegramAdapter:
         r.message(Command("conflicts"), GROUPS)(self.on_conflicts)
         r.message(Command("observe"), GROUPS)(self.on_observe)
         r.message(Command("captcha"), GROUPS)(self.on_captcha_command)
+        r.message(Command("cleanservice"), GROUPS)(self.on_cleanservice)
+        r.message(Command("ocr"), GROUPS)(self.on_ocr)
+        r.message(Command("firststrict"), GROUPS)(self.on_firststrict)
+        r.message(Command("antiraid"), GROUPS)(self.on_antiraid)
         r.message(Command("profilecheck"), GROUPS)(self.on_profilecheck)
         r.message(Command("profile"), GROUPS)(self.on_profile)
         r.message(Command("links"), GROUPS)(self.on_links)
@@ -503,6 +570,7 @@ class TelegramAdapter:
         r.callback_query(F.data.startswith("rev:"))(self.on_review_decision)
         r.callback_query(F.data.startswith("obs:"))(self.on_trial_verdict)
         r.callback_query(F.data.startswith("cap:"))(self.on_captcha_button)
+        r.callback_query(F.data.startswith("raid:"))(self.on_raid_button)
         r.message(GROUPS)(self.on_group_message)
         r.edited_message(GROUPS)(self.on_edited_message)
 
@@ -650,7 +718,11 @@ class TelegramAdapter:
             f"Аналитика комментариев: {on_off(config.analytics)}\n"
             f"Ссылки: {LINK_MODE_LABEL[config.links_mode]}\n"
             f"Проверка профиля новичков: {on_off(config.profile_check)}\n"
+            f"Удаление служебных сообщений («вошёл», «вышел»): {on_off(config.clean_service)}\n"
+            f"Предупреждения о рейдах: {on_off(config.antiraid)}\n"
+            f"Строгая проверка первых комментариев под постом: {on_off(config.first_strict)}\n"
             f"Проверка «я человек» для новичков: {on_off(config.captcha)}\n"
+            f"Чтение текста на картинках новичков: {on_off(config.image_ocr and self.ocr.available)}\n"
             f"Пробный режим (ничего не удаляю): {on_off(config.observe)}\n\n"
             f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам и мошенничество — всегда запрещены"
         )
@@ -676,7 +748,14 @@ class TelegramAdapter:
         await message.reply(f"{title}: {on_off(arg == 'on')}")
 
     async def on_lockdown(self, message: Message, command: CommandObject) -> None:
-        await self._switch(message, command, "lockdown", "Удалять всё от участников")
+        arg = await self.admin_args(message, command)
+        if arg is None:
+            return
+        if arg not in ("on", "off"):
+            await message.reply("Напишите <code>/lockdown on</code> или <code>/lockdown off</code>")
+            return
+        await self.storage.set_lockdown(message.chat.id, arg == "on")
+        await message.reply(f"Удалять всё от участников: {on_off(arg == 'on')}")
 
     async def on_escalation(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "escalation", "Мут и бан за повторные нарушения")
@@ -971,9 +1050,23 @@ class TelegramAdapter:
     # --------------------------------------------------------------- moderation
 
     async def remember_post(self, message: Message) -> None:
-        text = message.text or message.caption
-        if text:
-            await self.storage.add_post(message.chat.id, message.message_id, text)
+        text = message.text or message.caption or ""  # a photo post without a caption still has a publication time
+        date = message.date
+        await self.storage.add_post(
+            message.chat.id, message.message_id, text, int(date.timestamp()) if isinstance(date, datetime) else None
+        )
+
+    async def seconds_after_post(self, message: Message) -> int | None:
+        """How long after the channel post the comment was written, if the post is known."""
+        parent = message.reply_to_message
+        post_id = message.message_thread_id or (
+            parent.message_id if parent is not None and parent.is_automatic_forward is True else None
+        )
+        published = await self.storage.get_post_ts(message.chat.id, post_id) if post_id else None
+        if published is None:
+            return None
+        written = message.date.timestamp() if isinstance(message.date, datetime) else time.time()
+        return max(int(written - published), 0)
 
     async def comment_context(self, message: Message) -> tuple[str | None, str | None]:
         """Text of the channel post the comment is under, and of the comment it replies to."""
@@ -1028,6 +1121,11 @@ class TelegramAdapter:
             if not edited:
                 await self.remember_post(message)
             return
+        kind = getattr(message.content_type, "value", message.content_type)
+        if kind in SERVICE_KINDS:
+            if not edited:
+                await self.handle_service(message, kind)
+            return
         text = message.text or message.caption
         if not text and (edited or not media_label(message)):
             return  # nothing to judge, and not a member's own message either (service messages, edits of media)
@@ -1060,12 +1158,18 @@ class TelegramAdapter:
             return
 
         config = ChatConfig.from_row(chat)
-        key = example_key(text)
+        previous = await self.storage.message_count(chat_id, author_id)
+        image_text = None
+        if (
+            config.image_ocr and self.ocr.available and not sender and not edited
+            and previous < NEWCOMER_MESSAGES and not config.lockdown and not config.blanket
+        ):
+            image_text = await self.read_image_text(message)
+        key = example_key(text or image_text or "")
         known = await self.storage.example_kind(chat_id, key) if key else None
         post_text, reply_to_text = (None, None)
         if not config.lockdown and not config.blanket:
             post_text, reply_to_text = await self.comment_context(message)
-        previous = await self.storage.message_count(chat_id, author_id)
         profile = None
         if config.profile_check and not sender and previous < NEWCOMER_MESSAGES and not edited:
             try:
@@ -1088,6 +1192,8 @@ class TelegramAdapter:
             post_text=post_text,
             reply_to_text=reply_to_text,
             links=self.extract_links(message),
+            seconds_after_post=await self.seconds_after_post(message) if config.first_strict and not edited else None,
+            image_text=image_text,
         )
 
         if (
@@ -1114,6 +1220,8 @@ class TelegramAdapter:
             await self.storage.count_message(chat_id, author_id)
             if text and decision.action not in DELETING_ACTIONS:
                 self.spawn(self.watch_thread(message, text, config, chat))
+        if image_text:
+            decision.extra["image_text"] = image_text
         v = decision.verdict
         if v is None:
             if config.captcha and not sender and not edited and not config.observe and survived(decision):
@@ -1124,7 +1232,7 @@ class TelegramAdapter:
             message_id=message.message_id,
             user_id=author_id,
             user_name=author_name,
-            text=text or media_label(message) or "[сообщение без текста]",
+            text=text or self.shown_text(message, decision) or media_label(message) or "[сообщение без текста]",
             category=v.category.value,
             confidence=v.confidence,
             bot_probability=v.bot_probability,
@@ -1162,7 +1270,7 @@ class TelegramAdapter:
         text = (
             f"🔎 <b>Пробный режим</b>, чат «{title}»: я {DECISION_LABEL[decision.action]} комментарий от "
             f"{html.escape(name)}.\nПричина: {html.escape(decision.reason)}.\n"
-            f"{quote(message.text or message.caption)}\n"
+            f"{quote(self.shown_text(message, decision))}\n"
             f"{chat_message_link(message.chat.id, message.message_id, message.chat.username)}"
         )
         if left == 0:
@@ -1221,6 +1329,81 @@ class TelegramAdapter:
             + ("\n\n✅ Записал: бот прав." if right else "\n\n↩️ Записал: бот ошибся, такие комментарии буду пропускать.")
         )
         await call.answer()
+
+    # ------------------------------------------------- service messages and raids
+
+    async def handle_service(self, message: Message, kind: str) -> None:
+        chat_id = message.chat.id
+        chat = await self.storage.get_chat(chat_id)
+        if not chat or not chat["enabled"]:
+            return
+        config = ChatConfig.from_row(chat)
+        if kind == "new_chat_members" and config.antiraid:
+            joined = len(message.new_chat_members) if isinstance(message.new_chat_members, list) else 1
+            count = self.raid_count(chat_id, max(joined, 1))
+            if count:
+                await self.raid_alert(chat_id, chat, count)
+        if config.clean_service and not config.observe and kind in CLEANABLE_SERVICE:
+            try:
+                await message.delete()
+            except TelegramAPIError:
+                pass  # no right to delete, or already gone
+
+    def raid_count(self, chat_id: int, joined: int) -> int | None:
+        """Register joins; the number of people who joined in the last minute once it looks like a raid, else None."""
+        now = time.time()
+        stamps = self._joins.setdefault(chat_id, deque(maxlen=200))
+        stamps.extend([now] * joined)
+        recent = sum(1 for t in stamps if now - t <= RAID_WINDOW)
+        if recent < RAID_JOINS or now - self._raid_alerted.get(chat_id, 0) < RAID_COOLDOWN:
+            return None
+        self._raid_alerted[chat_id] = now
+        return recent
+
+    async def raid_alert(self, chat_id: int, chat, count: int) -> None:
+        title = html.escape(await self.chat_title(chat_id))
+        await self.dm(
+            chat["owner_id"],
+            f"🚨 Возможный рейд в чате «{title}»: {count} новых участников за минуту.\n"
+            f"Если это не ожидаемый наплыв (например, после большого поста), можно на {RAID_FREEZE_MINUTES} минут "
+            "включить удаление всех сообщений участников: спамеры не смогут ничего написать.",
+            kb([(f"🔒 Заморозить на {RAID_FREEZE_MINUTES} мин", f"raid:on:{chat_id}"), ("Это нормально", f"raid:no:{chat_id}")]),
+        )
+
+    async def on_raid_button(self, call: CallbackQuery) -> None:
+        _, action, chat_id = call.data.split(":")
+        chat_id = int(chat_id)
+        if not await self.is_admin(chat_id, call.from_user.id, fresh=True):
+            await call.answer("Это могут сделать только админы.", show_alert=True)
+            return
+        if action == "on":
+            until = int(time.time()) + RAID_FREEZE_MINUTES * 60
+            await self.storage.set_lockdown(chat_id, True, until)
+            self.spawn(self._end_freeze(chat_id, until))
+            note = f"🔒 Заморозил на {RAID_FREEZE_MINUTES} минут: все сообщения участников удаляются. Снять раньше: /lockdown off"
+        else:
+            note = "Хорошо, ничего не меняю."
+        await call.message.edit_text(call.message.html_text + "\n\n" + note)
+        await call.answer()
+
+    async def _end_freeze(self, chat_id: int, until: int) -> None:
+        await asyncio.sleep(max(until - time.time(), 0))
+        chat = await self.storage.get_chat(chat_id)
+        if chat and chat["lockdown"] and chat["lockdown_until"] == until:
+            await self.storage.set_lockdown(chat_id, False)
+            await self.dm(chat["owner_id"], f"🔓 Заморозка чата «{html.escape(await self.chat_title(chat_id))}» снята.")
+
+    async def on_cleanservice(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "clean_service", "Удаление служебных сообщений")
+
+    async def on_ocr(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "image_ocr", "Чтение текста на картинках новичков")
+
+    async def on_firststrict(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "first_strict", "Строгая проверка первых комментариев")
+
+    async def on_antiraid(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "antiraid", "Предупреждения о рейдах")
 
     async def note_admin_reply(self, message: Message, edited: bool) -> None:
         """An admin answered a comment: it stops counting as unanswered."""
@@ -1326,7 +1509,7 @@ class TelegramAdapter:
                     f"🤔 Не уверен насчёт комментария в чате «{title}»\n"
                     f"Автор: {html.escape(name)}. Причина: {html.escape(decision.reason)}. "
                     f"Бот уверен на {v.confidence:.0%}:\n"
-                    f"{quote(shown)}\n{chat_message_link(message.chat.id, message.message_id, message.chat.username)}",
+                    f"{quote(self.shown_text(message, decision))}\n{chat_message_link(message.chat.id, message.message_id, message.chat.username)}",
                     kb([("🗑 Удалить", f"rev:del:{log_id}"), ("✅ Оставить", f"rev:keep:{log_id}")]),
                 )
             elif action == ActionType.FORWARD_USEFUL and useful_mode == "instant":

@@ -5,6 +5,7 @@ Everything here is platform-independent. Adapters build a `Comment`, call
 """
 
 import json
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 
@@ -52,6 +53,7 @@ MIN_LETTERS = 2
 
 FLOOD_MUTE_MINUTES = 30
 NEWCOMER_MESSAGES = 3  # fewer messages than this in the chat means a newcomer
+FIRST_COMMENT_WINDOW = 120  # seconds after a post during which a newcomer's comment is "one of the first"
 
 # Repeat offenders: the Nth deleted comment in a chat escalates the action.
 MUTE_AT = 3
@@ -103,6 +105,10 @@ class ChatConfig:
     blocked_domains: list[str] = field(default_factory=list)
     profile_check: bool = True  # look at the profile of a newcomer
     captcha: bool = False  # ask newcomers to press a button
+    clean_service: bool = False  # delete "joined", "left" and similar service messages
+    antiraid: bool = True  # warn the owner about mass joins
+    first_strict: bool = True  # newcomers' comments in the first minutes under a post are judged strictly
+    image_ocr: bool = True  # read text on pictures and stickers of newcomers
 
     @property
     def prohibitions(self) -> list[Rule]:
@@ -128,7 +134,7 @@ class ChatConfig:
         return cls(
             rules=rules,
             mode=row["mode"] or "normal",
-            lockdown=bool(row["lockdown"]),
+            lockdown=_lockdown_active(row),
             escalation=bool(row["escalation"]),
             conflicts=_column(row, "conflicts", 1) == 1,
             antiflood=_column(row, "antiflood", 1) == 1,
@@ -142,6 +148,10 @@ class ChatConfig:
             blocked_domains=_json_list(_column(row, "blocked_domains", "[]")),
             profile_check=_column(row, "profile_check", 1) == 1,
             captcha=_column(row, "captcha", 0) == 1,
+            clean_service=_column(row, "clean_service", 0) == 1,
+            antiraid=_column(row, "antiraid", 1) == 1,
+            first_strict=_column(row, "first_strict", 1) == 1,
+            image_ocr=_column(row, "image_ocr", 1) == 1,
         )
 
 
@@ -164,6 +174,14 @@ def _json_list(value) -> list[str]:
     except json.JSONDecodeError:
         return []
     return [str(x) for x in data] if isinstance(data, list) else []
+
+
+def _lockdown_active(row: Mapping) -> bool:
+    """On, and either without an end time or before it (a freeze after a raid ends by itself)."""
+    if not row["lockdown"]:
+        return False
+    until = _column(row, "lockdown_until", 0)
+    return until == 0 or until > time.time()
 
 
 def _column(row: Mapping, name: str, default):
@@ -207,7 +225,11 @@ def build_state(comment: Comment, rules: list[Rule], allowed_domains: list[str] 
             profile["avatar_matches_a_banned_spammer"] = True
         if profile:
             author["profile"] = profile
-    state = {"rules": texts, "comment": comment.text, "author": author}
+    shown = comment.text
+    if comment.image_text:
+        note = f"[Картинка или стикер. Текст на ней распознан неточно, с ошибками]: {comment.image_text}"
+        shown = f"{comment.text}\n{note}" if comment.text else note
+    state = {"rules": texts, "comment": shown, "author": author}
     if normalized != comment.text:
         state["comment_with_letters_restored"] = normalized
     if comment.links:
@@ -353,6 +375,7 @@ def decide(
     escalation: bool = True,
     previous_deletions: int = 0,
     newcomer: bool = False,
+    image_evidence: bool = False,
 ) -> Decision:
     reason = explain(verdict, prohibitions)
     if newcomer and verdict.profile_bait > verdict.bot_probability:
@@ -379,6 +402,9 @@ def decide(
                 action, reason = ActionType.DELETE_AND_BAN, f"{reason} (повторные нарушения)"
             elif strikes >= MUTE_AT and action != ActionType.DELETE_AND_MUTE:
                 action, reason = ActionType.DELETE_AND_MUTE, f"{reason} (повторные нарушения)"
+        if image_evidence and action == ActionType.DELETE_AND_BAN:
+            # Text read from a picture is noisy: remove the message, but never ban on that alone.
+            action, reason = ActionType.DELETE_SILENT, f"{reason} (по тексту на картинке)"
         if action == ActionType.DELETE_AND_MUTE:
             extra["mute_hours"] = MUTE_HOURS
         return Decision(action, verdict, reason, extra)
@@ -422,9 +448,17 @@ class Moderator:
         if config.lockdown or config.blanket:
             return self._blanket(config)
         newcomer = config.profile_check and comment.author.previous_messages < NEWCOMER_MESSAGES
+        # Spam bots race for the first place under a new post, so those newcomers are judged strictly.
+        rushed = (
+            config.first_strict
+            and comment.author.previous_messages < NEWCOMER_MESSAGES
+            and comment.seconds_after_post is not None
+            and comment.seconds_after_post <= FIRST_COMMENT_WINDOW
+        )
+        thresholds = MODES["strict"] if rushed else config.thresholds
         if newcomer and comment.author.profile and comment.author.profile.avatar_match:
-            return avatar_decision(config.thresholds)
-        if not needs_check(comment.text, comment.links):
+            return avatar_decision(thresholds)
+        if not needs_check(comment.text + (comment.image_text or ""), comment.links):
             return Decision(ActionType.NONE)
         if known == "allow":
             return Decision(ActionType.NONE, None, "админ уже разрешил такой комментарий")
@@ -441,10 +475,11 @@ class Moderator:
         return decide(
             parse_verdict(response),
             prohibitions,
-            config.thresholds,
+            thresholds,
             config.escalation,
             comment.author.previous_deletions,
             newcomer=newcomer,
+            image_evidence=bool(comment.image_text),
         )
 
     def _link_decision(self, comment: Comment, config: ChatConfig, prohibitions: list[Rule]) -> Decision | None:

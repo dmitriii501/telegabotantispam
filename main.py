@@ -25,6 +25,8 @@ async def main() -> None:
     jev = JevClient(os.environ["TYPESAFE_API_KEY"], model=os.getenv("JEV_MODEL", "jev-latest"))
     bot = Bot(os.environ["TELEGRAM_BOT_TOKEN"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     adapter = TelegramAdapter(bot, Moderator(jev), storage)
+    if not adapter.ocr.available:
+        logging.getLogger(__name__).warning("Tesseract is not installed: text on pictures will not be read")
     digest_task = asyncio.create_task(adapter.digest_loop())
     web_runner = None
     if adapter.webapp_url:

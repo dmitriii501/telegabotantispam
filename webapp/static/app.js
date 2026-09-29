@@ -419,6 +419,35 @@ async function saveLinks(patch) {
   renderApp();
 }
 
+function copyCard() {
+  const others = state.chats.filter((c) => c.chat_id !== state.chatId);
+  if (!others.length) return "";
+  return `<div class="h">Перенос настроек</div>
+    <div class="card">
+      <div>Скопировать правила и настройки из другого чата</div>
+      <div class="row" style="display:flex;gap:8px;margin-top:8px">
+        <select id="copySource">${others.map((c) => `<option value="${esc(c.chat_id)}">${esc(c.title)}</option>`).join("")}</select>
+        <button class="btn ghost" id="copyGo">Скопировать</button>
+      </div>
+      <div class="tag" style="margin-top:8px">Владелец, список доверенных и накопленные решения остаются как есть.</div>
+    </div>`;
+}
+
+async function copySettings() {
+  const select = $("#copySource");
+  const title = select.options[select.selectedIndex].text;
+  confirmAction(`Правила и настройки этого чата будут заменены настройками чата «${title}». Продолжить?`, async () => {
+    try {
+      await api("POST", `/chat/${state.chatId}/copy`, { from: Number(select.value) });
+      toast("Настройки скопированы ✅");
+      haptic("success");
+      openChat(state.chatId);
+    } catch (e) {
+      fail(e);
+    }
+  });
+}
+
 function segmented(key, options) {
   const cur = state.data.settings[key];
   return `<div class="seg">${options
@@ -446,6 +475,10 @@ function renderSettings() {
       ${toggle("escalation", "Мут и бан за повторы", "3-е нарушение за 30 дней — мут на сутки, 5-е — бан")}
       ${toggle("antiflood", "Антифлуд", "Мут за много сообщений подряд. Пороги ниже настраиваются")}
       ${floodFields()}
+      ${toggle("image_ocr", "Читать текст на картинках", "Реклама в виде картинки или стикера у новичков: бот распознаёт надпись. На автобан это не влияет")}
+      ${toggle("first_strict", "Строго к первым комментариям", "Новички, написавшие в первые 2 минуты после поста (так спам-боты занимают первое место), проверяются строже")}
+      ${toggle("antiraid", "Предупреждать о рейдах", "Сообщу вам, если за минуту зашло много новых участников, и предложу заморозить чат")}
+      ${toggle("clean_service", "Убирать служебные сообщения", "Удалять «вошёл в группу», «вышел» и подобные записи")}
       ${toggle("captcha", "Проверка «я человек»", "Новичок после первого сообщения нажимает нужную кнопку за 2 минуты, иначе сообщение удаляется и мут на сутки")}
       ${toggle("profile_check", "Проверка профиля новичков", "Имя, ник, описание и аватарка новичка: ловит аккаунты-приманки")}
       ${toggle("conflicts", "Предупреждать о ссорах", "Сообщу вам, если обсуждение накаляется")}
@@ -454,6 +487,7 @@ function renderSettings() {
       ${toggle("lockdown", "Удалять всё от участников", "Временная мера при рейде: удаляются все сообщения не-админов")}
     </div>
     ${linksCard()}
+    ${copyCard()}
     <div class="h">Полезные комментарии: куда присылать</div>
     <div class="card">${segmented("useful_mode", [["digest", "В сводку"], ["instant", "Сразу"], ["off", "Не нужно"]])}</div>
     <div class="h">Не проверять</div>
@@ -464,6 +498,7 @@ function renderSettings() {
     const t = e.target;
     if (t.dataset.seg) saveSetting(t.dataset.seg, t.dataset.v);
     if (t.dataset.linksMode) saveLinks({ mode: t.dataset.linksMode });
+    if (t.id === "copyGo") copySettings();
     if (t.dataset.untrust) untrust(Number(t.dataset.untrust));
   };
   view.onchange = (e) => {
