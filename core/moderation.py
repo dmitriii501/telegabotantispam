@@ -4,12 +4,14 @@ Everything here is platform-independent. Adapters build a `Comment`, call
 `Moderator.check`, and execute the returned `Decision`.
 """
 
+import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from core.jev_client import JevClient
 from core.models import ActionType, Category, Comment, Decision, Verdict
 from core.fallback import looks_like_spam
+from core.links import any_match, extract_links, outside
 from core.normalizer import normalize
 from core.rules import (
     BASE_RULE,
@@ -49,6 +51,7 @@ ACTION_MAP = {
 MIN_LETTERS = 2
 
 FLOOD_MUTE_MINUTES = 30
+NEWCOMER_MESSAGES = 3  # fewer messages than this in the chat means a newcomer
 
 # Repeat offenders: the Nth deleted comment in a chat escalates the action.
 MUTE_AT = 3
@@ -66,12 +69,19 @@ class Thresholds:
     silent_bot_probability: float = 0.3  # above this the author is not clearly human
     useful_confidence: float = 0.7
     suspect: float = 0.4  # "normal" comments this likely to break a rule go to the admin
+    profile_review: float = 0.75  # a newcomer's profile this bait-like sends the message to the admin
+    avatar_deletes: bool = True  # a picture of a known spammer removes the message (False: ask the admin)
 
 
 MODES = {
-    "soft": Thresholds(review_below=0.85, ban_confidence=0.95, ban_bot_probability=0.8, suspect=0.5),
+    "soft": Thresholds(
+        review_below=0.85, ban_confidence=0.95, ban_bot_probability=0.8, suspect=0.5,
+        profile_review=0.85, avatar_deletes=False,
+    ),
     "normal": Thresholds(),
-    "strict": Thresholds(review_below=0.55, ban_confidence=0.85, ban_bot_probability=0.6, suspect=0.3),
+    "strict": Thresholds(
+        review_below=0.55, ban_confidence=0.85, ban_bot_probability=0.6, suspect=0.3, profile_review=0.6
+    ),
 }
 
 
@@ -88,6 +98,11 @@ class ChatConfig:
     flood_messages: int = 6  # this many messages ...
     flood_window: int = 20  # ... within this many seconds trigger the antiflood mute
     flood_mute_minutes: int = 30
+    links_mode: str = "ai"  # "ai": Jev decides; "block": only allowed links; "newcomers": newcomers may not post links
+    allowed_domains: list[str] = field(default_factory=list)
+    blocked_domains: list[str] = field(default_factory=list)
+    profile_check: bool = True  # look at the profile of a newcomer
+    captcha: bool = False  # ask newcomers to press a button
 
     @property
     def prohibitions(self) -> list[Rule]:
@@ -122,6 +137,11 @@ class ChatConfig:
             flood_messages=int(_column(row, "flood_messages", 6)),
             flood_window=int(_column(row, "flood_window", 20)),
             flood_mute_minutes=int(_column(row, "flood_mute", 30)),
+            links_mode=_column(row, "links_mode", "ai"),
+            allowed_domains=_json_list(_column(row, "allowed_domains", "[]")),
+            blocked_domains=_json_list(_column(row, "blocked_domains", "[]")),
+            profile_check=_column(row, "profile_check", 1) == 1,
+            captcha=_column(row, "captcha", 0) == 1,
         )
 
 
@@ -136,6 +156,14 @@ TENSION_QUESTION = {
 }
 TENSION_ALERT = 1.4  # score at or above this warns the owner
 TENSION_MIN_CONFIDENCE = 0.5
+
+
+def _json_list(value) -> list[str]:
+    try:
+        data = json.loads(value) if isinstance(value, str) else value
+    except json.JSONDecodeError:
+        return []
+    return [str(x) for x in data] if isinstance(data, list) else []
 
 
 def _column(row: Mapping, name: str, default):
@@ -157,7 +185,7 @@ def _clip(text: str | None) -> str | None:
     return text if len(text) <= CONTEXT_LIMIT else text[:CONTEXT_LIMIT] + "…"
 
 
-def build_state(comment: Comment, rules: list[Rule]) -> dict:
+def build_state(comment: Comment, rules: list[Rule], allowed_domains: list[str] | None = None) -> dict:
     normalized = normalize(comment.text)
     a = comment.author
     author = {
@@ -169,11 +197,23 @@ def build_state(comment: Comment, rules: list[Rule]) -> dict:
     }
     # Everything the admin wrote goes in: permissions and context help Jev too.
     texts = [BASE_RULE.text, *(r.text for r in rules if r.kind != EVERYTHING)]
+    if a.profile:
+        profile = {}
+        if a.profile.bio is not None:
+            profile["bio"] = _clip(a.profile.bio) or "пусто"
+        if a.profile.has_photo is not None:
+            profile["has_profile_photo"] = a.profile.has_photo
+        if a.profile.avatar_match:
+            profile["avatar_matches_a_banned_spammer"] = True
+        if profile:
+            author["profile"] = profile
     state = {"rules": texts, "comment": comment.text, "author": author}
     if normalized != comment.text:
         state["comment_with_letters_restored"] = normalized
     if comment.links:
         state["links_in_the_message"] = comment.links[:10]
+    if allowed_domains:
+        state["links_this_chat_allows_and_owns"] = allowed_domains[:30]
     if comment.post_text:
         state["post_the_comment_is_under"] = _clip(comment.post_text)
     if comment.reply_to_text:
@@ -188,6 +228,18 @@ KIND_CRITERIA = {
     "suggestion": "Предлагает идею, улучшение или тему для будущих постов",
     "bug": "Указывает на ошибку, неточность или опечатку в посте или продукте",
     "chat": "Обычное общение, эмоции, реакция, шутка, спор с другими",
+}
+PROFILE_QUESTION = {
+    "type": "noul",
+    "instructions": (
+        "Профиль автора в `author` (имя, ник, описание профиля) выглядит как профиль бота-заманухи: "
+        "имя в стиле знакомств или с эмодзи-приманками, ник из случайных цифр, в описании ссылка "
+        "или призыв написать в личку?"
+    ),
+    "criteria": {
+        "true": "Приманка: провокационное имя или эмодзи, ник из цифр, ссылка или призыв в описании",
+        "false": "Обычный профиль живого человека",
+    },
 }
 ANALYTICS_QUESTIONS = {
     "kind": {
@@ -211,7 +263,7 @@ ANALYTICS_QUESTIONS = {
 }
 
 
-def build_questions(prohibitions: list[Rule], analytics: bool = False) -> dict:
+def build_questions(prohibitions: list[Rule], analytics: bool = False, profile: bool = False) -> dict:
     rule_options = {f"r{i}": rule.text for i, rule in enumerate(prohibitions)}
     rule_options["none"] = "Комментарий не нарушает ни одно правило"
     questions = {
@@ -236,6 +288,8 @@ def build_questions(prohibitions: list[Rule], analytics: bool = False) -> dict:
     }
     if analytics:
         questions.update(ANALYTICS_QUESTIONS)
+    if profile:
+        questions["profile_bait"] = PROFILE_QUESTION
     return questions
 
 
@@ -261,6 +315,7 @@ def parse_verdict(response: dict) -> Verdict:
         lead=float(answers.get("lead", {}).get("noul", 0.0)),
         needs_answer=float(answers.get("needs_answer", {}).get("noul", 0.0)),
         sentiment=float(answers["sentiment"]["score"]) if "sentiment" in answers else None,
+        profile_bait=float(answers.get("profile_bait", {}).get("noul", 0.0)),
     )
 
 
@@ -282,14 +337,27 @@ def _auto_action(verdict: Verdict, t: Thresholds) -> ActionType:
     return ActionType.DELETE_AND_EXPLAIN
 
 
+def avatar_decision(t: Thresholds) -> Decision:
+    """A newcomer whose picture belongs to a spammer we already banned: no need to ask the AI."""
+    verdict = Verdict(Category.SPAM, 1.0, 1.0)
+    reason = "у аккаунта аватарка, как у известного спамера"
+    if t.avatar_deletes:
+        return Decision(ActionType.DELETE_SILENT, verdict, reason)
+    return Decision(ActionType.SEND_TO_REVIEW, verdict, reason)
+
+
 def decide(
     verdict: Verdict,
     prohibitions: list[Rule],
     t: Thresholds = Thresholds(),
     escalation: bool = True,
     previous_deletions: int = 0,
+    newcomer: bool = False,
 ) -> Decision:
     reason = explain(verdict, prohibitions)
+    if newcomer and verdict.profile_bait > verdict.bot_probability:
+        # A lure-like profile makes a spam bot more likely, whatever the comment itself looks like.
+        verdict = replace(verdict, bot_probability=verdict.profile_bait)
     if verdict.category in (Category.SPAM, Category.RULE_VIOLATION):
         if verdict.confidence < t.review_below:
             return Decision(ActionType.SEND_TO_REVIEW, verdict, reason)
@@ -314,6 +382,8 @@ def decide(
         if action == ActionType.DELETE_AND_MUTE:
             extra["mute_hours"] = MUTE_HOURS
         return Decision(action, verdict, reason, extra)
+    if newcomer and verdict.profile_bait >= t.profile_review:
+        return Decision(ActionType.SEND_TO_REVIEW, verdict, "подозрительный профиль новичка")
     if verdict.violation_probability >= t.suspect:
         # Jev calls it fine, but not by much: let the admin decide instead of missing a violation.
         return Decision(ActionType.SEND_TO_REVIEW, verdict, "возможное нарушение")
@@ -351,6 +421,9 @@ class Moderator:
         """`known` is what the admin (or the bot itself) already decided about this exact text."""
         if config.lockdown or config.blanket:
             return self._blanket(config)
+        newcomer = config.profile_check and comment.author.previous_messages < NEWCOMER_MESSAGES
+        if newcomer and comment.author.profile and comment.author.profile.avatar_match:
+            return avatar_decision(config.thresholds)
         if not needs_check(comment.text, comment.links):
             return Decision(ActionType.NONE)
         if known == "allow":
@@ -358,8 +431,12 @@ class Moderator:
         if known == "remove":
             return _blanket_decision(Rule("", PROHIBITION, "delete"), "такой комментарий уже удаляли")
         prohibitions = config.prohibitions
+        by_links = self._link_decision(comment, config, prohibitions)
+        if by_links:
+            return by_links
         response = await self.jev.ask(
-            build_state(comment, config.rules), build_questions(prohibitions, config.analytics)
+            build_state(comment, config.rules, config.allowed_domains),
+            build_questions(prohibitions, config.analytics, profile=newcomer),
         )
         return decide(
             parse_verdict(response),
@@ -367,7 +444,34 @@ class Moderator:
             config.thresholds,
             config.escalation,
             comment.author.previous_deletions,
+            newcomer=newcomer,
         )
+
+    def _link_decision(self, comment: Comment, config: ChatConfig, prohibitions: list[Rule]) -> Decision | None:
+        """The owner's link lists are enforced by code, so they work the same with or without the AI."""
+        links = extract_links(comment.text, comment.links)
+        if not links:
+            return None
+        newcomer = comment.author.previous_messages < NEWCOMER_MESSAGES
+        if config.blocked_domains and any_match(links, config.blocked_domains):
+            rules, reason, action = [Rule("", PROHIBITION, "delete")], "ссылка из чёрного списка этого чата", "delete"
+        elif outside(links, config.allowed_domains) and (
+            config.links_mode == "block" or (config.links_mode == "newcomers" and newcomer)
+        ):
+            reason = (
+                "в этом чате можно публиковать только разрешённые ссылки"
+                if config.links_mode == "block"
+                else "новичкам пока нельзя публиковать ссылки"
+            )
+            rules, action = [Rule("", PROHIBITION, "warn")], "warn"
+        else:
+            return None
+        verdict = Verdict(Category.RULE_VIOLATION, 1.0, 0.0, rule_index=0)
+        decision = decide(
+            verdict, rules, config.thresholds, config.escalation, comment.author.previous_deletions
+        )
+        note = " (повторные нарушения)" if "повторные" in decision.reason else ""
+        return replace(decision, reason=reason + note)
 
     def fallback(self, comment: Comment, config: ChatConfig) -> Decision:
         """Local protection for the time Jev is down: only well-known spam, only with a lead-away."""

@@ -5,6 +5,15 @@ from enum import Enum
 
 
 @dataclass
+class Profile:
+    """What is known about a newcomer's profile; None fields mean Telegram did not tell us."""
+
+    bio: str | None = None
+    has_photo: bool | None = None
+    avatar_match: bool = False  # the picture looks like one used by a spammer we already banned
+
+
+@dataclass
 class Author:
     user_id: int
     display_name: str
@@ -13,6 +22,7 @@ class Author:
     # Filled in from storage by the adapter before moderation.
     previous_messages: int = 0
     previous_deletions: int = 0
+    profile: Profile | None = None
 
 
 @dataclass
@@ -51,6 +61,7 @@ class Verdict:
     lead: float = 0.0  # wants to buy, asks the price, asks to be contacted
     needs_answer: float = 0.0  # the author waits for a reply from the owner
     sentiment: float | None = None  # 0 negative .. 2 positive
+    profile_bait: float = 0.0  # the profile of a newcomer looks like that of a lure bot
 
 
 class ActionType(str, Enum):

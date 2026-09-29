@@ -1,9 +1,11 @@
 """SQLite storage: chat settings, moderation log, per-user counters, appeals, posts."""
 
+import json
 import time
 
 import aiosqlite
 
+from core.avatar import similar
 from core.normalizer import example_key
 
 SCHEMA = """
@@ -65,6 +67,23 @@ CREATE TABLE IF NOT EXISTS examples (
     ts INTEGER NOT NULL,
     PRIMARY KEY (chat_id, key)
 );
+CREATE TABLE IF NOT EXISTS profiles (
+    user_id INTEGER PRIMARY KEY,
+    bio TEXT,
+    has_photo INTEGER,
+    avatar_hash TEXT,
+    fetched_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS avatar_bans (
+    hash TEXT PRIMARY KEY,
+    ts INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS verified (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+);
 CREATE TABLE IF NOT EXISTS trusted (
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -90,6 +109,11 @@ CHAT_COLUMNS = [
     ("flood_messages", "INTEGER NOT NULL DEFAULT 6"),
     ("flood_window", "INTEGER NOT NULL DEFAULT 20"),
     ("flood_mute", "INTEGER NOT NULL DEFAULT 30"),
+    ("links_mode", "TEXT NOT NULL DEFAULT 'ai'"),
+    ("allowed_domains", "TEXT NOT NULL DEFAULT '[]'"),
+    ("blocked_domains", "TEXT NOT NULL DEFAULT '[]'"),
+    ("profile_check", "INTEGER NOT NULL DEFAULT 1"),
+    ("captcha", "INTEGER NOT NULL DEFAULT 0"),
 ]
 LOG_COLUMNS = [
     ("executed", "INTEGER NOT NULL DEFAULT 1"),
@@ -100,7 +124,11 @@ LOG_COLUMNS = [
     ("violation", "REAL"),
     ("answered", "INTEGER NOT NULL DEFAULT 0"),
 ]
-SETTINGS = {name for name, _ in CHAT_COLUMNS} - {"rules_json", "pending_json", "digest_last"} | {"enabled"}
+SETTINGS = (
+    {name for name, _ in CHAT_COLUMNS}
+    - {"rules_json", "pending_json", "digest_last", "allowed_domains", "blocked_domains"}
+    | {"enabled"}
+)
 
 DAY = 24 * 3600
 DELETION_WINDOW_DAYS = 30
@@ -197,6 +225,14 @@ class Storage:
         await self.db.execute("UPDATE chats SET owner_id = ? WHERE chat_id = ? AND owner_id IS NULL", (user_id, chat_id))
         await self.db.commit()
 
+    async def set_links(self, chat_id: int, mode: str, allowed: list[str], blocked: list[str]) -> None:
+        await self.ensure_chat(chat_id)
+        await self.db.execute(
+            "UPDATE chats SET links_mode = ?, allowed_domains = ?, blocked_domains = ? WHERE chat_id = ?",
+            (mode, json.dumps(allowed), json.dumps(blocked), chat_id),
+        )
+        await self.db.commit()
+
     async def set_enabled(self, chat_id: int, enabled: bool) -> None:
         await self.set_setting(chat_id, "enabled", int(enabled))
 
@@ -251,6 +287,55 @@ class Storage:
     async def is_trusted(self, chat_id: int, user_id: int) -> bool:
         async with self.db.execute(
             "SELECT 1 FROM trusted WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    # --- profiles of newcomers and the shared base of spammer avatars ---
+
+    async def get_profile(self, user_id: int, max_age: int) -> aiosqlite.Row | None:
+        async with self.db.execute(
+            "SELECT * FROM profiles WHERE user_id = ? AND fetched_at >= ?", (user_id, int(time.time()) - max_age)
+        ) as cur:
+            return await cur.fetchone()
+
+    async def save_profile(self, user_id: int, bio: str | None, has_photo: bool | None, avatar_hash: str | None) -> None:
+        await self.db.execute(
+            "INSERT OR REPLACE INTO profiles (user_id, bio, has_photo, avatar_hash, fetched_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, bio, None if has_photo is None else int(has_photo), avatar_hash, int(time.time())),
+        )
+        await self.db.commit()
+
+    async def forget_profile(self, user_id: int) -> None:
+        await self.db.execute("DELETE FROM profiles WHERE user_id = ?", (user_id,))
+        await self.db.commit()
+
+    async def avatar_banned(self, avatar_hash: str) -> bool:
+        async with self.db.execute("SELECT hash FROM avatar_bans") as cur:
+            return any(similar(avatar_hash, row["hash"]) for row in await cur.fetchall())
+
+    async def add_avatar_ban(self, avatar_hash: str) -> None:
+        await self.db.execute("INSERT OR IGNORE INTO avatar_bans (hash, ts) VALUES (?, ?)", (avatar_hash, int(time.time())))
+        await self.db.commit()
+
+    async def remove_avatar_ban(self, avatar_hash: str) -> None:
+        """Forget a picture (and every near copy of it): a person was wrongly taken for a spammer."""
+        async with self.db.execute("SELECT hash FROM avatar_bans") as cur:
+            stale = [row["hash"] for row in await cur.fetchall() if similar(avatar_hash, row["hash"])]
+        for h in stale:
+            await self.db.execute("DELETE FROM avatar_bans WHERE hash = ?", (h,))
+        await self.db.commit()
+
+    # --- "I am human" checks passed ---
+
+    async def set_verified(self, chat_id: int, user_id: int) -> None:
+        await self.db.execute(
+            "INSERT OR REPLACE INTO verified (chat_id, user_id, ts) VALUES (?, ?, ?)", (chat_id, user_id, int(time.time()))
+        )
+        await self.db.commit()
+
+    async def is_verified(self, chat_id: int, user_id: int) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM verified WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
         ) as cur:
             return await cur.fetchone() is not None
 
@@ -397,6 +482,7 @@ class Storage:
         cutoff = int(time.time()) - days * DAY
         cur = await self.db.execute("DELETE FROM log WHERE ts < ?", (cutoff,))
         await self.db.execute("DELETE FROM appeals WHERE ts < ?", (cutoff,))
+        await self.db.execute("DELETE FROM profiles WHERE fetched_at < ?", (cutoff,))
         await self.db.commit()
         return cur.rowcount
 

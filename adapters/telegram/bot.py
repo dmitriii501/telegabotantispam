@@ -8,6 +8,7 @@ import asyncio
 import html
 import logging
 import os
+import random
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -30,9 +31,18 @@ from aiogram.types import (
     WebAppInfo,
 )
 
+from core.avatar import dhash
 from core.jev_client import JevError
-from core.models import DELETING_ACTIONS, ActionType, Author, Comment, Decision
-from core.moderation import MODES, TENSION_ALERT, TENSION_MIN_CONFIDENCE, ChatConfig, Moderator
+from core.links import MAX_ENTRIES, normalize_entry
+from core.models import DELETING_ACTIONS, ActionType, Author, Comment, Decision, Profile
+from core.moderation import (
+    MODES,
+    NEWCOMER_MESSAGES,
+    TENSION_ALERT,
+    TENSION_MIN_CONFIDENCE,
+    ChatConfig,
+    Moderator,
+)
 from core.normalizer import example_key
 from core.rules import CONTEXT, EVERYTHING, PERMISSION, Rule, rules_to_json
 from core.storage import DAY, Storage
@@ -50,6 +60,16 @@ CONFLICT_MIN_MESSAGES = 6
 CONFLICT_RECHECK = 5 * 60
 CONFLICT_COOLDOWN = 60 * 60  # do not warn about the same thread twice in an hour
 THREAD_BUFFER = 30
+# "I am human" check: the newcomer presses the button with the named picture.
+CAPTCHA_TIMEOUT = 120  # seconds
+CAPTCHA_MUTE_HOURS = 24
+CAPTCHA_PICTURES = [
+    ("🍎", "яблоко"), ("🐱", "кота"), ("🚗", "машину"), ("⭐", "звезду"),
+    ("🌵", "кактус"), ("🎈", "шар"), ("🍕", "пиццу"), ("🐟", "рыбу"),
+]
+PROFILE_TTL = 3 * 24 * 3600  # how long a fetched profile is reused
+PROFILE_TIMEOUT = 4.0  # seconds a newcomer's first message may wait for the profile lookup
+
 # Trial mode is silent by nature, so the owner gets a few live examples to see that the bot works.
 TRIAL_NOTICES_PER_DAY = 5
 TRIAL_ADMIN_TESTS_PER_DAY = 20
@@ -108,6 +128,16 @@ USEFUL_LABEL = {
     "instant": "полезные комментарии буду присылать сразу",
     "off": "полезные комментарии присылать не буду",
 }
+LINK_MODE_LABEL = {
+    "ai": "решает ИИ: подозрительные ссылки удаляются, остальные можно",
+    "block": "разрешены только ссылки из списка",
+    "newcomers": "новичкам ссылки нельзя, остальным решает ИИ",
+}
+LINKS_HELP = (
+    "Изменить: <code>/links ai</code>, <code>/links block</code> или <code>/links newcomers</code>; "
+    "<code>/allowlink адрес</code> разрешает сайт или канал (например <code>t.me/mychannel</code>), "
+    "<code>/blocklink адрес</code> запрещает, <code>/unlink адрес</code> убирает из списков."
+)
 JEV_PRICE_PER_MTOK = 0.042  # dollars per million input tokens
 NOT_ADMIN = "я не админ"
 RIGHTS_TEXT = (
@@ -139,6 +169,9 @@ HELP_TEXT = (
     "/check текст — что бы я сделал с таким комментарием (ничего не удаляя)\n"
     "/observe on|off — пробный режим: ничего не удалять, только записывать\n"
     "/mode soft|normal|strict — строгость: soft чаще спрашивает вас, strict удаляет смелее\n"
+    "/links [ai|block|newcomers] — ссылки: /allowlink, /blocklink, /unlink адрес — списки сайтов и каналов\n"
+    "/captcha on|off — новичок после первого сообщения нажимает нужную кнопку, иначе сообщение удаляется и мут на сутки\n"
+    "/profilecheck on|off — проверять профиль новичков; /profile ответом на сообщение покажет, что бот видит\n"
     "/lockdown on|off — удалять всё от участников (на время рейда)\n"
     "/escalation on|off — мут на сутки за 3-е нарушение и бан за 5-е (за 30 дней)\n"
     "/antiflood [5 10 60|off] — мут за флуд: сообщений, секунд, минут мута; без чисел покажет настройку\n"
@@ -163,7 +196,30 @@ def chat_message_link(chat_id: int, message_id: int, username: str | None = None
     return f"https://t.me/c/{str(chat_id).removeprefix('-100')}/{message_id}"
 
 
-def quote(text: str, limit: int = 700) -> str:
+# Message types a member can post without any text; service messages ("joined", "pinned") are not among them.
+MEDIA_LABEL = {
+    "sticker": "[стикер]",
+    "photo": "[фото]",
+    "video": "[видео]",
+    "animation": "[гиф]",
+    "voice": "[голосовое]",
+    "video_note": "[кружок]",
+    "audio": "[аудио]",
+    "document": "[файл]",
+    "poll": "[опрос]",
+    "dice": "[кубик]",
+    "contact": "[контакт]",
+    "location": "[геопозиция]",
+}
+
+
+def media_label(message) -> str | None:
+    kind = getattr(message.content_type, "value", message.content_type)
+    return MEDIA_LABEL.get(kind) if isinstance(kind, str) else None
+
+
+def quote(text: str | None, limit: int = 700) -> str:
+    text = text or "[сообщение без текста]"
     text = text if len(text) <= limit else text[:limit] + "…"
     return f"<blockquote>{html.escape(text)}</blockquote>"
 
@@ -198,6 +254,11 @@ def describe_antiflood(config: ChatConfig) -> str:
     )
 
 
+def survived(decision: Decision) -> bool:
+    """The message stays in the chat and nobody is waiting to decide about it."""
+    return decision.action in (ActionType.NONE, ActionType.FORWARD_USEFUL)
+
+
 def human_duration(hours: float) -> str:
     minutes = round(hours * 60)
     if minutes < 60:
@@ -224,6 +285,7 @@ class TelegramAdapter:
         self._linked: dict[int, int | None] = {}
         self._tasks: set[asyncio.Task] = set()  # strong references: a bare create_task can be garbage collected
         self._trial: dict[tuple[int, str], deque] = {}
+        self._captcha: dict[tuple[int, int], dict] = {}  # open checks: (chat, user) -> answer, messages
         self._purged_day = ""
         self.webapp_url = os.getenv("WEBAPP_URL", "").rstrip("/")
         self.router = Router()
@@ -255,6 +317,55 @@ class TelegramAdapter:
             return False
         await self.storage.claim_owner(message.chat.id, message.from_user.id)
         return True
+
+    async def _load_profile(self, user_id: int):
+        """Ask Telegram for the bio and the picture and store what came. Failures only mean "unknown"."""
+        bio = has_photo = avatar_hash = None
+        try:
+            info = await self.bot.get_chat(user_id)
+            bio = info.bio if isinstance(getattr(info, "bio", None), str) else None
+        except Exception as e:  # any failure means "bio unknown"; moderation must never depend on it
+            log.info("profile: bio of %s unavailable: %s", user_id, e)
+        try:
+            photos = await self.bot.get_user_profile_photos(user_id, limit=1)
+            has_photo = photos.total_count > 0
+            if has_photo:
+                sizes = photos.photos[0]
+                data = await self.bot.download(sizes[min(1, len(sizes) - 1)].file_id)
+                avatar_hash = dhash(data.getvalue()) if data else None
+        except Exception as e:
+            log.info("profile: picture of %s unavailable: %s", user_id, e)
+        await self.storage.save_profile(user_id, bio, has_photo, avatar_hash)
+        log.info("profile: user=%s bio=%s photo=%s fingerprint=%s", user_id, bio is not None, has_photo, bool(avatar_hash))
+        return await self.storage.get_profile(user_id, PROFILE_TTL)
+
+    async def fetch_profile(self, user_id: int) -> Profile | None:
+        """Bio, picture and whether the picture belongs to a known spammer; cached for a few days. Never raises."""
+        try:
+            row = await self.storage.get_profile(user_id, PROFILE_TTL) or await self._load_profile(user_id)
+            if row is None:
+                return None
+            match = bool(row["avatar_hash"]) and await self.storage.avatar_banned(row["avatar_hash"])
+            return Profile(
+                bio=row["bio"], has_photo=None if row["has_photo"] is None else bool(row["has_photo"]), avatar_match=match
+            )
+        except Exception:
+            log.exception("profile lookup failed for %s", user_id)
+            return None
+
+    async def _avatar_hash(self, user_id: int) -> str | None:
+        row = await self.storage.get_profile(user_id, 30 * DAY) or await self._load_profile(user_id)
+        return row["avatar_hash"] if row else None
+
+    async def learn_avatar(self, user_id: int) -> None:
+        """A spam bot was banned: remember its picture, so the next account with it is caught at once."""
+        if user_id > 0 and (fingerprint := await self._avatar_hash(user_id)):
+            await self.storage.add_avatar_ban(fingerprint)
+
+    async def forget_avatar(self, user_id: int) -> None:
+        """The admin says the person was not a spammer: their picture must not count against anybody."""
+        if user_id > 0 and (fingerprint := await self._avatar_hash(user_id)):
+            await self.storage.remove_avatar_ban(fingerprint)
 
     def trial_slot(self, chat_id: int, kind: str, limit: int) -> int | None:
         """Use one of today's `limit` trial-mode messages; returns how many are left, None when none were."""
@@ -375,6 +486,11 @@ class TelegramAdapter:
         r.message(Command("trust", "untrust"), GROUPS)(self.on_trust)
         r.message(Command("conflicts"), GROUPS)(self.on_conflicts)
         r.message(Command("observe"), GROUPS)(self.on_observe)
+        r.message(Command("captcha"), GROUPS)(self.on_captcha_command)
+        r.message(Command("profilecheck"), GROUPS)(self.on_profilecheck)
+        r.message(Command("profile"), GROUPS)(self.on_profile)
+        r.message(Command("links"), GROUPS)(self.on_links)
+        r.message(Command("allowlink", "blocklink", "unlink"), GROUPS)(self.on_link_lists)
         r.message(Command("antiflood"), GROUPS)(self.on_antiflood)
         r.message(Command("analytics"), GROUPS)(self.on_analytics)
         r.message(Command("report"), GROUPS)(self.on_report)
@@ -386,6 +502,7 @@ class TelegramAdapter:
         r.callback_query(F.data.startswith("ap:"))(self.on_appeal_decision)
         r.callback_query(F.data.startswith("rev:"))(self.on_review_decision)
         r.callback_query(F.data.startswith("obs:"))(self.on_trial_verdict)
+        r.callback_query(F.data.startswith("cap:"))(self.on_captcha_button)
         r.message(GROUPS)(self.on_group_message)
         r.edited_message(GROUPS)(self.on_edited_message)
 
@@ -531,6 +648,9 @@ class TelegramAdapter:
             f"Предупреждения о ссорах: {on_off(config.conflicts)}\n"
             f"Антифлуд: {describe_antiflood(config)}\n"
             f"Аналитика комментариев: {on_off(config.analytics)}\n"
+            f"Ссылки: {LINK_MODE_LABEL[config.links_mode]}\n"
+            f"Проверка профиля новичков: {on_off(config.profile_check)}\n"
+            f"Проверка «я человек» для новичков: {on_off(config.captcha)}\n"
             f"Пробный режим (ничего не удаляю): {on_off(config.observe)}\n\n"
             f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам и мошенничество — всегда запрещены"
         )
@@ -563,6 +683,167 @@ class TelegramAdapter:
 
     async def on_conflicts(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "conflicts", "Предупреждения о ссорах")
+
+    async def on_captcha_command(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "captcha", "Проверка «я человек» для новичков")
+
+    # ------------------------------------------------------------ "I am human" check
+
+    async def maybe_challenge(self, message: Message, user_id: int, previous_messages: int) -> None:
+        """A newcomer's first message got through: ask them to press the right button, or lose the message."""
+        chat_id = message.chat.id
+        if previous_messages > 0 or (chat_id, user_id) in self._captcha or await self.storage.is_verified(chat_id, user_id):
+            return
+        options = random.sample(range(len(CAPTCHA_PICTURES)), 4)
+        answer = random.choice(options)
+        user = message.from_user
+        mention = f'<a href="tg://user?id={user_id}">{html.escape(user.first_name)}</a>'
+        markup = kb([(CAPTCHA_PICTURES[i][0], f"cap:{chat_id}:{user_id}:{i}") for i in options])
+        try:
+            notice = await self.bot.send_message(
+                chat_id,
+                f"{mention}, подтвердите, что вы человек: нажмите на {CAPTCHA_PICTURES[answer][1]}. "
+                f"Иначе ваше первое сообщение будет удалено.",
+                reply_to_message_id=message.message_id,
+                reply_markup=markup,
+            )
+        except TelegramAPIError as e:
+            log.info("Cannot post the human check: %s", e)
+            return
+        self._captcha[(chat_id, user_id)] = {
+            "answer": answer,
+            "message_id": message.message_id,
+            "notice_id": notice.message_id,
+            "name": user.full_name,
+            "text": message.text or message.caption or media_label(message) or "[сообщение без текста]",
+        }
+        self.spawn(self._captcha_timeout(chat_id, user_id))
+
+    async def _captcha_timeout(self, chat_id: int, user_id: int) -> None:
+        await asyncio.sleep(CAPTCHA_TIMEOUT)
+        if (chat_id, user_id) in self._captcha:
+            await self.fail_captcha(chat_id, user_id, "не ответил вовремя")
+
+    async def fail_captcha(self, chat_id: int, user_id: int, why: str) -> None:
+        pending = self._captcha.pop((chat_id, user_id), None)
+        if not pending:
+            return
+        for message_id in (pending["notice_id"], pending["message_id"]):
+            try:
+                await self.bot.delete_message(chat_id, message_id)
+            except TelegramAPIError:
+                pass
+        try:
+            await self.bot.restrict_chat_member(
+                chat_id, user_id, permissions=ChatPermissions(can_send_messages=False),
+                until_date=timedelta(hours=CAPTCHA_MUTE_HOURS),
+            )
+        except TelegramAPIError as e:
+            log.warning("Cannot mute after a failed human check: %s", e)
+        await self.storage.add_log(
+            chat_id=chat_id, message_id=pending["message_id"], user_id=user_id, user_name=pending["name"],
+            text=pending["text"], category="captcha", confidence=1.0, bot_probability=1.0,
+            action=ActionType.DELETE_AND_MUTE.value, reason=f"не прошёл проверку «я человек»: {why}", tokens=0,
+        )
+
+    async def on_captcha_button(self, call: CallbackQuery) -> None:
+        _, chat_id, user_id, picked = call.data.split(":")
+        chat_id, user_id, picked = int(chat_id), int(user_id), int(picked)
+        if call.from_user.id != user_id:
+            await call.answer("Эта кнопка не для вас.", show_alert=True)
+            return
+        pending = self._captcha.get((chat_id, user_id))
+        if pending is None:
+            await call.answer("Проверка устарела. Просто напишите сообщение ещё раз.", show_alert=True)
+            try:
+                await call.message.delete()
+            except TelegramAPIError:
+                pass
+            return
+        if picked != pending["answer"]:
+            await call.answer("Неверно.", show_alert=True)
+            await self.fail_captcha(chat_id, user_id, "нажал не ту кнопку")
+            return
+        self._captcha.pop((chat_id, user_id), None)
+        await self.storage.set_verified(chat_id, user_id)
+        try:
+            await call.message.delete()
+        except TelegramAPIError:
+            pass
+        await call.answer("Спасибо, проверка пройдена!")
+
+    async def on_profilecheck(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "profile_check", "Проверка профиля новичков")
+
+    async def on_profile(self, message: Message) -> None:
+        """Ответом на сообщение: что бот видит в профиле этого человека (заодно проверка, что Telegram отдаёт боту)."""
+        if not await self.is_admin_message(message):
+            return
+        target = message.reply_to_message.from_user if message.reply_to_message else None
+        if not target:
+            await message.reply("Ответьте этой командой на сообщение человека.")
+            return
+        await self.storage.forget_profile(target.id)  # always a fresh look
+        profile = await self.fetch_profile(target.id)
+        if profile is None:
+            await message.reply("Не удалось получить профиль.")
+            return
+        bio = "недоступно боту" if profile.bio is None else (html.escape(profile.bio) or "пусто")
+        photo = {None: "недоступно боту", True: "есть", False: "нет"}[profile.has_photo]
+        base = "совпадает с аватаркой известного спамера" if profile.avatar_match else "нет совпадений"
+        await message.reply(
+            f"<b>{html.escape(target.full_name)}</b> "
+            f"{'@' + html.escape(target.username) if target.username else '(без ника)'}\n"
+            f"Описание профиля: {bio}\n"
+            f"Фото профиля: {photo}\n"
+            f"База аватарок спамеров: {base}\n"
+            f"Проверка профиля новичков: {on_off((await self.config(message.chat.id)).profile_check)}"
+        )
+
+    async def on_links(self, message: Message, command: CommandObject) -> None:
+        arg = await self.admin_args(message, command)
+        if arg is None:
+            return
+        chat_id = message.chat.id
+        if arg:
+            if arg not in LINK_MODE_LABEL:
+                await message.reply(LINKS_HELP)
+                return
+            config = await self.config(chat_id)
+            await self.storage.set_links(chat_id, arg, config.allowed_domains, config.blocked_domains)
+        await message.reply(self.describe_links(await self.config(chat_id)))
+
+    async def on_link_lists(self, message: Message, command: CommandObject) -> None:
+        arg = await self.admin_args(message, command)
+        if arg is None:
+            return
+        entry = normalize_entry(arg) if arg else None
+        if not entry:
+            await message.reply("Напишите адрес сайта или канала, например <code>example.com</code> или <code>t.me/mychannel</code>.")
+            return
+        chat_id = message.chat.id
+        config = await self.config(chat_id)
+        allowed = [e for e in config.allowed_domains if e != entry]
+        blocked = [e for e in config.blocked_domains if e != entry]
+        if command.command == "allowlink":
+            allowed.append(entry)
+        elif command.command == "blocklink":
+            blocked.append(entry)
+        if len(allowed) > MAX_ENTRIES or len(blocked) > MAX_ENTRIES:
+            await message.reply(f"В каждом списке может быть не больше {MAX_ENTRIES} адресов.")
+            return
+        await self.storage.set_links(chat_id, config.links_mode, allowed, blocked)
+        await message.reply(self.describe_links(await self.config(chat_id)))
+
+    @staticmethod
+    def describe_links(config: ChatConfig) -> str:
+        allowed = ", ".join(config.allowed_domains) or "пусто"
+        blocked = ", ".join(config.blocked_domains) or "пусто"
+        return (
+            f"<b>Ссылки:</b> {LINK_MODE_LABEL[config.links_mode]}\n"
+            f"Разрешённые: {html.escape(allowed)}\n"
+            f"Запрещённые: {html.escape(blocked)}\n\n{LINKS_HELP}"
+        )
 
     async def on_observe(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "observe", "Пробный режим")
@@ -748,8 +1029,9 @@ class TelegramAdapter:
                 await self.remember_post(message)
             return
         text = message.text or message.caption
-        if not text:
-            return
+        if not text and (edited or not media_label(message)):
+            return  # nothing to judge, and not a member's own message either (service messages, edits of media)
+        text = text or ""  # stickers, photos and the like still count for the antiflood
         chat_id = message.chat.id
         chat = await self.storage.get_chat(chat_id)
         if chat and not chat["enabled"]:
@@ -783,6 +1065,13 @@ class TelegramAdapter:
         post_text, reply_to_text = (None, None)
         if not config.lockdown and not config.blanket:
             post_text, reply_to_text = await self.comment_context(message)
+        previous = await self.storage.message_count(chat_id, author_id)
+        profile = None
+        if config.profile_check and not sender and previous < NEWCOMER_MESSAGES and not edited:
+            try:
+                profile = await asyncio.wait_for(self.fetch_profile(author_id), PROFILE_TIMEOUT)
+            except asyncio.TimeoutError:
+                log.info("profile lookup of %s timed out", author_id)
         comment = Comment(
             chat_id=chat_id,
             message_id=message.message_id,
@@ -792,8 +1081,9 @@ class TelegramAdapter:
                 display_name=author_name,
                 username=username,
                 is_premium=premium,
-                previous_messages=await self.storage.message_count(chat_id, author_id),
+                previous_messages=previous,
                 previous_deletions=await self.storage.recent_deletions(chat_id, author_id),
+                profile=profile,
             ),
             post_text=post_text,
             reply_to_text=reply_to_text,
@@ -822,17 +1112,19 @@ class TelegramAdapter:
 
         if not edited:
             await self.storage.count_message(chat_id, author_id)
-            if decision.action not in DELETING_ACTIONS:
+            if text and decision.action not in DELETING_ACTIONS:
                 self.spawn(self.watch_thread(message, text, config, chat))
         v = decision.verdict
         if v is None:
+            if config.captcha and not sender and not edited and not config.observe and survived(decision):
+                await self.maybe_challenge(message, author_id, previous)
             return  # nothing to record: skipped without asking Jev
         log_id = await self.storage.add_log(
             chat_id=chat_id,
             message_id=message.message_id,
             user_id=author_id,
             user_name=author_name,
-            text=text,
+            text=text or media_label(message) or "[сообщение без текста]",
             category=v.category.value,
             confidence=v.confidence,
             bot_probability=v.bot_probability,
@@ -855,6 +1147,10 @@ class TelegramAdapter:
             await self.storage.add_example(chat_id, key, "remove")
         if not await self.execute(message, decision, log_id, chat):
             await self.storage.set_executed(log_id, False)
+        elif decision.action == ActionType.DELETE_AND_BAN and v.category.value == "spam" and not sender:
+            await self.learn_avatar(author_id)
+        if config.captcha and not sender and not edited and survived(decision):
+            await self.maybe_challenge(message, author_id, previous)
 
     async def trial_notice(self, message: Message, decision: Decision, log_id: int, chat, name: str) -> None:
         """Trial mode: show the owner the first few things the bot would remove, with a verdict button."""
@@ -916,6 +1212,10 @@ class TelegramAdapter:
             return
         right = call.data.startswith("obs:ok")
         await self.storage.set_feedback(entry["id"], "confirmed" if right else "not_spam")
+        if right and entry["action"] == ActionType.DELETE_AND_BAN.value and entry["category"] == "spam":
+            await self.learn_avatar(entry["user_id"])
+        elif not right:
+            await self.forget_avatar(entry["user_id"])
         await call.message.edit_text(
             call.message.html_text
             + ("\n\n✅ Записал: бот прав." if right else "\n\n↩️ Записал: бот ошибся, такие комментарии буду пропускать.")
@@ -1114,6 +1414,7 @@ class TelegramAdapter:
         """The admin says the deletion was wrong: repost the text and undo the penalties."""
         chat_id, user_id = entry["chat_id"], entry["user_id"]
         await self.storage.set_feedback(entry["id"], "not_spam")
+        await self.forget_avatar(user_id)
         if entry["action"] == ActionType.DELETE_AND_MUTE.value:
             await self._lift_restrictions(chat_id, user_id)
         elif entry["action"] == ActionType.DELETE_AND_BAN.value:

@@ -383,6 +383,42 @@ function floodFields() {
   ).join("")}</div>`;
 }
 
+const LINK_HINT = {
+  ai: "ИИ удаляет подозрительные ссылки, остальные можно.",
+  block: "Разрешены только ссылки из списка ниже.",
+  newcomers: "Новичкам ссылки нельзя, остальным решает ИИ.",
+};
+
+function linksCard() {
+  const l = state.data.links;
+  return `<div class="h">Ссылки</div>
+    <div class="card">
+      <div>Что можно публиковать</div>
+      <div class="seg">${[["ai", "Решает ИИ"], ["block", "Только из списка"], ["newcomers", "Не новичкам"]]
+        .map(([v, label]) => `<button data-links-mode="${v}" class="${l.mode === v ? "on" : ""}">${label}</button>`)
+        .join("")}</div>
+      <div class="tag" style="margin-top:8px">${esc(LINK_HINT[l.mode])}</div>
+      <div class="set" style="display:block;border:0">
+        <small>Разрешённые адреса (по одному в строке: сайт или канал вроде t.me/mychannel)</small>
+        <textarea class="paste" rows="3" data-links-list="allowed" style="min-height:60px">${esc(l.allowed.join("\n"))}</textarea>
+        <small style="margin-top:8px">Запрещённые адреса: сообщение с такой ссылкой удаляется сразу</small>
+        <textarea class="paste" rows="3" data-links-list="blocked" style="min-height:60px">${esc(l.blocked.join("\n"))}</textarea>
+      </div>
+    </div>`;
+}
+
+async function saveLinks(patch) {
+  try {
+    const res = await api("PUT", `/chat/${state.chatId}/links`, patch);
+    Object.assign(state.data.links, patch, { allowed: res.allowed, blocked: res.blocked });
+    toast("Сохранено ✅");
+    haptic("light");
+  } catch (e) {
+    fail(e);
+  }
+  renderApp();
+}
+
 function segmented(key, options) {
   const cur = state.data.settings[key];
   return `<div class="seg">${options
@@ -410,11 +446,14 @@ function renderSettings() {
       ${toggle("escalation", "Мут и бан за повторы", "3-е нарушение за 30 дней — мут на сутки, 5-е — бан")}
       ${toggle("antiflood", "Антифлуд", "Мут за много сообщений подряд. Пороги ниже настраиваются")}
       ${floodFields()}
+      ${toggle("captcha", "Проверка «я человек»", "Новичок после первого сообщения нажимает нужную кнопку за 2 минуты, иначе сообщение удаляется и мут на сутки")}
+      ${toggle("profile_check", "Проверка профиля новичков", "Имя, ник, описание и аватарка новичка: ловит аккаунты-приманки")}
       ${toggle("conflicts", "Предупреждать о ссорах", "Сообщу вам, если обсуждение накаляется")}
       ${toggle("analytics", "Аналитика комментариев", "Тип, тон и «ждёт ответа» для каждого комментария")}
       ${toggle("digest", "Ежедневная сводка", "Каждый день в 09:00 по Москве")}
       ${toggle("lockdown", "Удалять всё от участников", "Временная мера при рейде: удаляются все сообщения не-админов")}
     </div>
+    ${linksCard()}
     <div class="h">Полезные комментарии: куда присылать</div>
     <div class="card">${segmented("useful_mode", [["digest", "В сводку"], ["instant", "Сразу"], ["off", "Не нужно"]])}</div>
     <div class="h">Не проверять</div>
@@ -424,6 +463,7 @@ function renderSettings() {
   view.onclick = (e) => {
     const t = e.target;
     if (t.dataset.seg) saveSetting(t.dataset.seg, t.dataset.v);
+    if (t.dataset.linksMode) saveLinks({ mode: t.dataset.linksMode });
     if (t.dataset.untrust) untrust(Number(t.dataset.untrust));
   };
   view.onchange = (e) => {
@@ -440,6 +480,10 @@ function renderSettings() {
               : null;
       if (warning) confirmAction(warning, () => saveSetting(key, on), renderSettings);
       else saveSetting(key, on);
+    }
+    if (e.target.dataset.linksList) {
+      const lines = e.target.value.split("\n").map((x) => x.trim()).filter(Boolean);
+      saveLinks({ [e.target.dataset.linksList]: lines });
     }
     if (e.target.dataset.int) {
       const [, , low, high] = FLOOD_FIELDS.find((f) => f[0] === e.target.dataset.int);

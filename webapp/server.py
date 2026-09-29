@@ -15,6 +15,7 @@ from aiohttp import web
 
 from core.jev_client import JevError
 from core.models import DELETING_ACTIONS, ActionType
+from core.links import MAX_ENTRIES, normalize_entry
 from core.moderation import MODES, ChatConfig
 from core.rules import ACTIONS, CONTEXT, EVERYTHING, PERMISSION, PROHIBITION, Rule, rules_to_json
 from webapp.auth import validate_init_data
@@ -27,9 +28,13 @@ MAX_RULE_LENGTH = 300
 MAX_PARSE_LENGTH = 2000
 KINDS = {PROHIBITION, PERMISSION, CONTEXT, EVERYTHING}
 USEFUL_MODES = {"digest", "instant", "off"}
+LINK_MODES = {"ai", "block", "newcomers"}
 INT_SETTINGS = {"flood_messages": (3, 30), "flood_window": (5, 120), "flood_mute": (1, 10080)}
 INT_LABELS = {"flood_messages": "Сообщений подряд", "flood_window": "Секунд", "flood_mute": "Минут мута"}
-BOOL_SETTINGS = ("lockdown", "escalation", "digest", "enabled", "conflicts", "antiflood", "analytics", "observe")
+BOOL_SETTINGS = (
+    "lockdown", "escalation", "digest", "enabled", "conflicts", "antiflood", "analytics", "observe",
+    "profile_check", "captcha",
+)
 DELETING = {a.value for a in DELETING_ACTIONS}
 
 CSP = (
@@ -139,10 +144,13 @@ def chat_payload(chat, trusted) -> dict:
             "flood_mute": config.flood_mute_minutes,
             "analytics": config.analytics,
             "observe": config.observe,
+            "profile_check": config.profile_check,
+            "captcha": config.captcha,
             "digest": bool(chat["digest"]),
             "useful_mode": chat["useful_mode"],
             "enabled": bool(chat["enabled"]),
         },
+        "links": {"mode": config.links_mode, "allowed": config.allowed_domains, "blocked": config.blocked_domains},
         "trusted": [{"user_id": t["user_id"], "name": t["name"]} for t in trusted],
     }
 
@@ -206,6 +214,32 @@ async def put_settings(request: web.Request) -> web.Response:
     for key, value in updates.items():
         await storage.set_setting(chat["chat_id"], key, value)
     return web.json_response({"ok": True})
+
+
+def clean_entries(value, title: str) -> list[str]:
+    if not isinstance(value, list) or len(value) > MAX_ENTRIES:
+        raise ApiError(400, f"{title}: не больше {MAX_ENTRIES} адресов")
+    result: list[str] = []
+    for item in value:
+        entry = normalize_entry(str(item)) if isinstance(item, str) else None
+        if not entry:
+            raise ApiError(400, f"{title}: «{str(item)[:40]}» не похоже на адрес сайта или канала")
+        if entry not in result:
+            result.append(entry)
+    return result
+
+
+async def put_links(request: web.Request) -> web.Response:
+    chat = await admin_chat(request, fresh=True)
+    data = await read_json(request)
+    config = ChatConfig.from_row(chat)
+    mode = data.get("mode", config.links_mode)
+    if mode not in LINK_MODES:
+        raise ApiError(400, "Неизвестный режим ссылок")
+    allowed = clean_entries(data["allowed"], "Разрешённые") if "allowed" in data else config.allowed_domains
+    blocked = clean_entries(data["blocked"], "Запрещённые") if "blocked" in data else config.blocked_domains
+    await request.app["adapter"].storage.set_links(chat["chat_id"], mode, allowed, blocked)
+    return web.json_response({"ok": True, "allowed": allowed, "blocked": blocked})
 
 
 async def parse_text(request: web.Request) -> web.Response:
@@ -343,6 +377,7 @@ def create_app(adapter, bot_token: str) -> web.Application:
     app.router.add_get("/api/chat/{chat_id}", get_chat)
     app.router.add_put("/api/chat/{chat_id}/rules", put_rules)
     app.router.add_put("/api/chat/{chat_id}/settings", put_settings)
+    app.router.add_put("/api/chat/{chat_id}/links", put_links)
     app.router.add_post("/api/chat/{chat_id}/parse", parse_text)
     app.router.add_get("/api/chat/{chat_id}/log", get_log)
     app.router.add_get("/api/chat/{chat_id}/insights", get_insights)
