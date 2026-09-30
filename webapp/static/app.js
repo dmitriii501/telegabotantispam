@@ -368,6 +368,8 @@ function toggle(key, title, hint) {
     <label class="sw"><input type="checkbox" data-set="${key}" ${on ? "checked" : ""}><i></i></label></div>`;
 }
 
+const INT_LIMITS = { night_from: [0, 23], night_to: [0, 23] };
+
 const FLOOD_FIELDS = [
   ["flood_messages", "Сообщений подряд", 3, 30],
   ["flood_window", "За сколько секунд", 5, 120],
@@ -532,7 +534,7 @@ function renderSettings() {
       saveLinks({ [e.target.dataset.linksList]: lines });
     }
     if (e.target.dataset.int) {
-      const [, , low, high] = FLOOD_FIELDS.find((f) => f[0] === e.target.dataset.int);
+      const [low, high] = INT_LIMITS[e.target.dataset.int] || FLOOD_FIELDS.find((f) => f[0] === e.target.dataset.int).slice(2);
       const value = Math.min(high, Math.max(low, parseInt(e.target.value, 10) || low));
       saveSetting(e.target.dataset.int, value);
     }
