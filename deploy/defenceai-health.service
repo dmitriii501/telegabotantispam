@@ -1,0 +1,6 @@
+[Unit]
+Description=DefenceAi health check
+
+[Service]
+Type=oneshot
+ExecStart=/opt/defenceai/deploy/healthcheck.sh

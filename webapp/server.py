@@ -8,6 +8,7 @@ there are no passwords and no separate accounts.
 
 import json
 import logging
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -29,11 +30,11 @@ MAX_PARSE_LENGTH = 2000
 KINDS = {PROHIBITION, PERMISSION, CONTEXT, EVERYTHING}
 USEFUL_MODES = {"digest", "instant", "off"}
 LINK_MODES = {"ai", "block", "newcomers"}
-INT_SETTINGS = {"flood_messages": (3, 30), "flood_window": (5, 120), "flood_mute": (1, 10080)}
-INT_LABELS = {"flood_messages": "Сообщений подряд", "flood_window": "Секунд", "flood_mute": "Минут мута"}
+INT_SETTINGS = {"flood_messages": (3, 30), "flood_window": (5, 120), "flood_mute": (1, 10080), "night_from": (0, 23), "night_to": (0, 23)}
+INT_LABELS = {"flood_messages": "Сообщений подряд", "flood_window": "Секунд", "flood_mute": "Минут мута", "night_from": "Начало ночи", "night_to": "Конец ночи"}
 BOOL_SETTINGS = (
     "lockdown", "escalation", "digest", "enabled", "conflicts", "antiflood", "analytics", "observe",
-    "profile_check", "captcha", "clean_service", "antiraid", "first_strict", "image_ocr",
+    "profile_check", "captcha", "clean_service", "antiraid", "first_strict", "image_ocr", "night_mode",
 )
 DELETING = {a.value for a in DELETING_ACTIONS}
 
@@ -149,6 +150,9 @@ def chat_payload(chat, trusted) -> dict:
             "clean_service": config.clean_service,
             "antiraid": config.antiraid,
             "first_strict": config.first_strict,
+            "night_mode": config.night_mode,
+            "night_from": config.night_from,
+            "night_to": config.night_to,
             "image_ocr": config.image_ocr,
             "digest": bool(chat["digest"]),
             "useful_mode": chat["useful_mode"],
@@ -160,6 +164,14 @@ def chat_payload(chat, trusted) -> dict:
 
 
 # ---------------------------------------------------------------------- handlers
+
+
+async def health(request: web.Request) -> web.Response:
+    """For the uptime check: the bot's event loop is alive and the daily-job loop is ticking."""
+    adapter = request.app["adapter"]
+    age = time.time() - adapter.heartbeat
+    jev = getattr(adapter.moderator.jev, "healthy", True)
+    return web.json_response({"ok": age < 180, "heartbeat_age": int(age), "jev": bool(jev)}, status=200 if age < 180 else 503)
 
 
 async def index(request: web.Request) -> web.StreamResponse:
@@ -394,6 +406,7 @@ def create_app(adapter, bot_token: str) -> web.Application:
     app["adapter"] = adapter
     app["token"] = bot_token
     app.router.add_get("/", index)
+    app.router.add_get("/health", health)
     app.router.add_static("/static", STATIC)
     app.router.add_get("/api/chats", list_chats)
     app.router.add_get("/api/chat/{chat_id}", get_chat)

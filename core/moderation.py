@@ -8,6 +8,7 @@ import json
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 
 from core.jev_client import JevClient
 from core.models import ActionType, Category, Comment, Decision, Verdict
@@ -52,6 +53,7 @@ ACTION_MAP = {
 MIN_LETTERS = 2
 
 FLOOD_MUTE_MINUTES = 30
+MOSCOW = timezone(timedelta(hours=3))
 NEWCOMER_MESSAGES = 3  # fewer messages than this in the chat means a newcomer
 FIRST_COMMENT_WINDOW = 120  # seconds after a post during which a newcomer's comment is "one of the first"
 
@@ -109,6 +111,17 @@ class ChatConfig:
     antiraid: bool = True  # warn the owner about mass joins
     first_strict: bool = True  # newcomers' comments in the first minutes under a post are judged strictly
     image_ocr: bool = True  # read text on pictures and stickers of newcomers
+    night_mode: bool = False  # at night: strict thresholds, and newcomers may not post links
+    night_from: int = 0  # Moscow hours, the night lasts from `night_from` up to `night_to`
+    night_to: int = 7
+
+    def night_active(self, now: datetime | None = None) -> bool:
+        if not self.night_mode:
+            return False
+        hour = ((now or datetime.now(timezone.utc)).astimezone(MOSCOW)).hour
+        if self.night_from <= self.night_to:
+            return self.night_from <= hour < self.night_to
+        return hour >= self.night_from or hour < self.night_to
 
     @property
     def prohibitions(self) -> list[Rule]:
@@ -152,6 +165,9 @@ class ChatConfig:
             antiraid=_column(row, "antiraid", 1) == 1,
             first_strict=_column(row, "first_strict", 1) == 1,
             image_ocr=_column(row, "image_ocr", 1) == 1,
+            night_mode=_column(row, "night_mode", 0) == 1,
+            night_from=int(_column(row, "night_from", 0)),
+            night_to=int(_column(row, "night_to", 7)),
         )
 
 
@@ -443,7 +459,9 @@ class Moderator:
     def __init__(self, jev: JevClient):
         self.jev = jev
 
-    async def check(self, comment: Comment, config: ChatConfig, known: str | None = None) -> Decision:
+    async def check(
+        self, comment: Comment, config: ChatConfig, known: str | None = None, now: datetime | None = None
+    ) -> Decision:
         """`known` is what the admin (or the bot itself) already decided about this exact text."""
         if config.lockdown or config.blanket:
             return self._blanket(config)
@@ -455,7 +473,8 @@ class Moderator:
             and comment.seconds_after_post is not None
             and comment.seconds_after_post <= FIRST_COMMENT_WINDOW
         )
-        thresholds = MODES["strict"] if rushed else config.thresholds
+        night = config.night_active(now)
+        thresholds = MODES["strict"] if rushed or night else config.thresholds
         if newcomer and comment.author.profile and comment.author.profile.avatar_match:
             return avatar_decision(thresholds)
         if not needs_check(comment.text + (comment.image_text or ""), comment.links):
@@ -465,7 +484,7 @@ class Moderator:
         if known == "remove":
             return _blanket_decision(Rule("", PROHIBITION, "delete"), "такой комментарий уже удаляли")
         prohibitions = config.prohibitions
-        by_links = self._link_decision(comment, config, prohibitions)
+        by_links = self._link_decision(comment, config, prohibitions, night)
         if by_links:
             return by_links
         response = await self.jev.ask(
@@ -482,7 +501,9 @@ class Moderator:
             image_evidence=bool(comment.image_text),
         )
 
-    def _link_decision(self, comment: Comment, config: ChatConfig, prohibitions: list[Rule]) -> Decision | None:
+    def _link_decision(
+        self, comment: Comment, config: ChatConfig, prohibitions: list[Rule], night: bool = False
+    ) -> Decision | None:
         """The owner's link lists are enforced by code, so they work the same with or without the AI."""
         links = extract_links(comment.text, comment.links)
         if not links:
@@ -491,11 +512,13 @@ class Moderator:
         if config.blocked_domains and any_match(links, config.blocked_domains):
             rules, reason, action = [Rule("", PROHIBITION, "delete")], "ссылка из чёрного списка этого чата", "delete"
         elif outside(links, config.allowed_domains) and (
-            config.links_mode == "block" or (config.links_mode == "newcomers" and newcomer)
+            config.links_mode == "block" or ((config.links_mode == "newcomers" or night) and newcomer)
         ):
             reason = (
                 "в этом чате можно публиковать только разрешённые ссылки"
                 if config.links_mode == "block"
+                else "ночью новичкам нельзя публиковать ссылки"
+                if night and config.links_mode != "newcomers"
                 else "новичкам пока нельзя публиковать ссылки"
             )
             rules, action = [Rule("", PROHIBITION, "warn")], "warn"

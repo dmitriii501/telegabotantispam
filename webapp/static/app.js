@@ -389,6 +389,15 @@ const LINK_HINT = {
   newcomers: "Новичкам ссылки нельзя, остальным решает ИИ.",
 };
 
+function nightFields() {
+  const s = state.data.settings;
+  if (!s.night_mode) return "";
+  return `<div class="set flood">${[["night_from", "С часа (МСК)"], ["night_to", "До часа (МСК)"]].map(
+    ([key, label]) => `<label class="num"><small>${label}</small>
+      <input type="number" inputmode="numeric" min="0" max="23" value="${esc(s[key])}" data-int="${key}"></label>`
+  ).join("")}</div>`;
+}
+
 function linksCard() {
   const l = state.data.links;
   return `<div class="h">Ссылки</div>
@@ -479,6 +488,8 @@ function renderSettings() {
       ${toggle("first_strict", "Строго к первым комментариям", "Новички, написавшие в первые 2 минуты после поста (так спам-боты занимают первое место), проверяются строже")}
       ${toggle("antiraid", "Предупреждать о рейдах", "Сообщу вам, если за минуту зашло много новых участников, и предложу заморозить чат")}
       ${toggle("clean_service", "Убирать служебные сообщения", "Удалять «вошёл в группу», «вышел» и подобные записи")}
+      ${toggle("night_mode", "Ночной режим", "В заданные часы проверка строже, а новичкам нельзя публиковать ссылки")}
+      ${nightFields()}
       ${toggle("captcha", "Проверка «я человек»", "Новичок после первого сообщения нажимает нужную кнопку за 2 минуты, иначе сообщение удаляется и мут на сутки")}
       ${toggle("profile_check", "Проверка профиля новичков", "Имя, ник, описание и аватарка новичка: ловит аккаунты-приманки")}
       ${toggle("conflicts", "Предупреждать о ссорах", "Сообщу вам, если обсуждение накаляется")}

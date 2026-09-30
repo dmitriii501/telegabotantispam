@@ -159,6 +159,28 @@ RIGHTS_TEXT = (
     "и «Блокировать пользователей»."
 )
 
+REPORT_THRESHOLD = 3  # different members complaining about one comment before the owner is asked
+
+
+PRIVACY_TEXT = (
+    """<b>Какие данные обрабатывает DefenceAi</b>
+
+<b>Что читает бот.</b> Только сообщения в чатах, куда его добавил администратор. Личные переписки участников он не видит.
+
+<b>Что сохраняется.</b>
+• Текст комментария, имя и номер автора, решение бота и причина: в журнале {days} дней, потом удаляется автоматически.
+• Отпечаток аватарки (короткий хеш, не картинка) и описание профиля новичка: до {days} дней; отпечатки аватарок забаненных спам-ботов хранятся в общей базе без имён и текстов.
+• Текст, прочитанный с картинок и стикеров новичков: до {days} дней.
+• Правила и настройки чата: пока бот в чате.
+
+<b>Куда передаётся.</b> Для проверки текст комментария, текст поста, под которым он написан, имя автора и (у новичков) описание профиля отправляются в ИИ-сервис TypeSafe. Картинки никуда не отправляются: текст на них читается на нашем сервере. Другим третьим лицам данные не передаются и не продаются.
+
+<b>Ваши права.</b> Если бот удалил ваш комментарий, нажмите «Оспорить» под уведомлением. Чтобы удалить ваши данные из журнала раньше срока, напишите администратору чата или владельцу сервиса.
+
+Бот не принимает решений вне чата и не делится репутацией участников между чатами, кроме отпечатков аватарок спам-ботов."""
+).replace("{days}", str(RETENTION_DAYS))
+
+
 HELP_TEXT = (
     "Я слежу за комментариями под постами: убираю спам и рекламу (в том числе замаскированную), "
     "нарушения ваших правил и подсказываю, кому вы не ответили.\n\n"
@@ -185,6 +207,9 @@ HELP_TEXT = (
     "/mode soft|normal|strict — строгость: soft чаще спрашивает вас, strict удаляет смелее\n"
     "/links [ai|block|newcomers] — ссылки: /allowlink, /blocklink, /unlink адрес — списки сайтов и каналов\n"
     "/firststrict on|off — новички, написавшие в первые 2 минуты после поста (так боты занимают первое место), проверяются строже\n"
+    "/spam — участники отвечают этой командой на плохой комментарий; после 3 жалоб бот спросит владельца\n"
+    "/privacy — какие данные хранит бот\n"
+    "/night on|off|0 7 — ночью (часы по Москве) проверка строже, а новичкам нельзя ссылки\n"
     "/antiraid on|off — предупреждать о массовых заходах; /cleanservice on|off — убирать «вошёл» и «вышел»\n"
     "/ocr on|off — читать текст на картинках и стикерах новичков (рекламу в виде картинки)\n"
     "/captcha on|off — новичок после первого сообщения нажимает нужную кнопку, иначе сообщение удаляется и мут на сутки\n"
@@ -262,6 +287,13 @@ ANTIFLOOD_HELP = (
 )
 
 
+def describe_night(config: ChatConfig) -> str:
+    if not config.night_mode:
+        return "выключен"
+    state = "сейчас идёт" if config.night_active() else "сейчас день"
+    return f"с {config.night_from}:00 до {config.night_to}:00 по Москве, {state}"
+
+
 def describe_antiflood(config: ChatConfig) -> str:
     if not config.antiflood:
         return "выключен"
@@ -307,6 +339,7 @@ class TelegramAdapter:
         self._raid_alerted: dict[int, float] = {}
         self._captcha: dict[tuple[int, int], dict] = {}  # open checks: (chat, user) -> answer, messages
         self._purged_day = ""
+        self.heartbeat = time.time()  # refreshed by the daily-job loop every minute; /health reads it
         self.webapp_url = os.getenv("WEBAPP_URL", "").rstrip("/")
         self.router = Router()
         self._register()
@@ -536,6 +569,7 @@ class TelegramAdapter:
     def _register(self) -> None:
         r = self.router
         r.message(CommandStart(), F.chat.type == ChatType.PRIVATE)(self.on_start)
+        r.message(Command("privacy"))(self.on_privacy)
         r.my_chat_member()(self.on_bot_added)
         r.message(Command("rules"), GROUPS)(self.on_rules)
         r.message(Command("stats"), GROUPS)(self.on_stats)
@@ -551,6 +585,8 @@ class TelegramAdapter:
         r.message(Command("observe"), GROUPS)(self.on_observe)
         r.message(Command("captcha"), GROUPS)(self.on_captcha_command)
         r.message(Command("cleanservice"), GROUPS)(self.on_cleanservice)
+        r.message(Command("night"), GROUPS)(self.on_night)
+        r.message(Command("spam"), GROUPS, F.reply_to_message)(self.on_spam_report)
         r.message(Command("ocr"), GROUPS)(self.on_ocr)
         r.message(Command("firststrict"), GROUPS)(self.on_firststrict)
         r.message(Command("antiraid"), GROUPS)(self.on_antiraid)
@@ -576,6 +612,9 @@ class TelegramAdapter:
 
     async def on_start(self, message: Message) -> None:
         await message.answer(HELP_TEXT, reply_markup=self.panel_markup())
+
+    async def on_privacy(self, message: Message) -> None:
+        await message.answer(PRIVACY_TEXT)
 
     async def on_help(self, message: Message) -> None:
         await message.answer(HELP_TEXT, reply_markup=self.panel_markup() if message.chat.type == ChatType.PRIVATE else None)
@@ -721,6 +760,7 @@ class TelegramAdapter:
             f"Удаление служебных сообщений («вошёл», «вышел»): {on_off(config.clean_service)}\n"
             f"Предупреждения о рейдах: {on_off(config.antiraid)}\n"
             f"Строгая проверка первых комментариев под постом: {on_off(config.first_strict)}\n"
+            f"Ночной режим: {describe_night(config)}\n"
             f"Проверка «я человек» для новичков: {on_off(config.captcha)}\n"
             f"Чтение текста на картинках новичков: {on_off(config.image_ocr and self.ocr.available)}\n"
             f"Пробный режим (ничего не удаляю): {on_off(config.observe)}\n\n"
@@ -1402,6 +1442,73 @@ class TelegramAdapter:
     async def on_firststrict(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "first_strict", "Строгая проверка первых комментариев")
 
+    async def on_spam_report(self, message: Message) -> None:
+        """A member replies `/spam` to a comment. Enough different people complaining sends it to the owner."""
+        target, user = message.reply_to_message, message.from_user
+        try:
+            await message.delete()  # the complaint itself should not stay in the chat
+        except TelegramAPIError:
+            pass
+        if not target or not user or target.from_user is None and target.sender_chat is None:
+            return
+        offender = target.from_user
+        if (
+            target.message_id == message.message_id
+            or (offender and (offender.id == user.id or offender.is_bot))
+            or (offender and await self.is_admin(message.chat.id, offender.id))
+            or (target.sender_chat and target.sender_chat.id == message.chat.id)
+        ):
+            return
+        if offender and await self.storage.is_trusted(message.chat.id, offender.id):
+            return
+        count = await self.storage.add_report(message.chat.id, target.message_id, user.id)
+        if count != REPORT_THRESHOLD:  # exactly once, when the threshold is reached
+            return
+        chat = await self.storage.get_chat(message.chat.id)
+        text = target.text or target.caption or f"[{getattr(target.content_type, 'value', target.content_type)}]"
+        name = target.sender_chat.title if target.sender_chat else offender.full_name
+        log_id = await self.storage.add_log(
+            chat_id=message.chat.id,
+            message_id=target.message_id,
+            user_id=(target.sender_chat or offender).id,
+            user_name=name,
+            text=text,
+            category="normal",
+            confidence=0.0,
+            bot_probability=0.0,
+            action=ActionType.SEND_TO_REVIEW.value,
+            reason=f"жалобы участников ({count})",
+        )
+        title = html.escape(await self.chat_title(message.chat.id))
+        await self.dm(
+            chat["owner_id"] if chat else None,
+            f"🚩 На комментарий в чате «{title}» пожаловались {count} участника.\n"
+            f"Автор: {html.escape(name)}:\n{quote(text)}\n"
+            f"{chat_message_link(message.chat.id, target.message_id, message.chat.username)}",
+            kb([("🗑 Удалить", f"rev:del:{log_id}"), ("✅ Оставить", f"rev:keep:{log_id}")]),
+        )
+
+    async def on_night(self, message: Message, command: CommandObject) -> None:
+        arg = await self.admin_args(message, command)
+        if arg is None:
+            return
+        parts = arg.split()
+        chat_id = message.chat.id
+        if len(parts) == 1 and parts[0] in ("on", "off"):
+            await self.storage.set_setting(chat_id, "night_mode", int(parts[0] == "on"))
+        elif len(parts) == 2 and all(p.isdigit() and 0 <= int(p) <= 23 for p in parts):
+            await self.storage.set_setting(chat_id, "night_from", int(parts[0]))
+            await self.storage.set_setting(chat_id, "night_to", int(parts[1]))
+            await self.storage.set_setting(chat_id, "night_mode", 1)
+        else:
+            await message.reply(
+                "Напишите <code>/night on</code>, <code>/night off</code> или часы по Москве: "
+                "<code>/night 0 7</code> (с полуночи до 7 утра)"
+            )
+            return
+        config = await self.config(chat_id)
+        await message.reply(f"Ночной режим: {describe_night(config)}")
+
     async def on_antiraid(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "antiraid", "Предупреждения о рейдах")
 
@@ -1733,6 +1840,7 @@ class TelegramAdapter:
     async def digest_loop(self) -> None:
         while True:
             await asyncio.sleep(60)
+            self.heartbeat = time.time()
             now = datetime.now(timezone.utc)
             if now.hour == DIGEST_HOUR_UTC:
                 try:

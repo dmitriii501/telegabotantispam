@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS ocr_cache (
     text TEXT NOT NULL,
     ts INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reports (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    reporter_id INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id, reporter_id)
+);
 CREATE TABLE IF NOT EXISTS trusted (
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -125,6 +132,9 @@ CHAT_COLUMNS = [
     ("lockdown_until", "INTEGER"),
     ("first_strict", "INTEGER NOT NULL DEFAULT 1"),
     ("image_ocr", "INTEGER NOT NULL DEFAULT 1"),
+    ("night_mode", "INTEGER NOT NULL DEFAULT 0"),
+    ("night_from", "INTEGER NOT NULL DEFAULT 0"),
+    ("night_to", "INTEGER NOT NULL DEFAULT 7"),
 ]
 LOG_COLUMNS = [
     ("executed", "INTEGER NOT NULL DEFAULT 1"),
@@ -144,7 +154,7 @@ SETTINGS = (
 COPIED_SETTINGS = (
     "mode", "escalation", "digest", "useful_mode", "conflicts", "antiflood", "analytics", "flood_messages",
     "flood_window", "flood_mute", "links_mode", "allowed_domains", "blocked_domains", "profile_check", "captcha",
-    "clean_service", "antiraid", "first_strict", "image_ocr",
+    "clean_service", "antiraid", "first_strict", "image_ocr", "night_mode", "night_from", "night_to",
 )
 DAY = 24 * 3600
 DELETION_WINDOW_DAYS = 30
@@ -539,11 +549,24 @@ class Storage:
         ) as cur:
             return await cur.fetchall()
 
+    async def add_report(self, chat_id: int, message_id: int, reporter_id: int) -> int:
+        """Record a member's complaint. Returns how many different people have complained about this message."""
+        await self.db.execute(
+            "INSERT OR IGNORE INTO reports (chat_id, message_id, reporter_id, ts) VALUES (?, ?, ?, ?)",
+            (chat_id, message_id, reporter_id, int(time.time())),
+        )
+        await self.db.commit()
+        async with self.db.execute(
+            "SELECT COUNT(*) FROM reports WHERE chat_id = ? AND message_id = ?", (chat_id, message_id)
+        ) as cur:
+            return (await cur.fetchone())[0]
+
     async def purge_old(self, days: int) -> int:
         """Drop comment texts and log rows older than `days` (personal data must not live forever)."""
         cutoff = int(time.time()) - days * DAY
         cur = await self.db.execute("DELETE FROM log WHERE ts < ?", (cutoff,))
         await self.db.execute("DELETE FROM appeals WHERE ts < ?", (cutoff,))
+        await self.db.execute("DELETE FROM reports WHERE ts < ?", (cutoff,))
         await self.db.execute("DELETE FROM profiles WHERE fetched_at < ?", (cutoff,))
         await self.db.execute("DELETE FROM ocr_cache WHERE ts < ?", (cutoff,))
         await self.db.commit()

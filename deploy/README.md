@@ -63,6 +63,12 @@ bash deploy/setup_https.sh defenceaibot.duckdns.org
 Если сертификат не выдаётся: проверь `journalctl -u caddy -f`, что домен указывает на IP сервера
 (`getent hosts defenceaibot.duckdns.org`) и что порты 80 и 443 открыты в панели хостера.
 
+## Проверка живости и алерт
+
+`deploy/install.sh` включает таймер `defenceai-health.timer`: раз в 2 минуты `healthcheck.sh` проверяет службу, адрес `/health` и место на диске.
+Чтобы получать сообщения в Telegram, впиши в `/opt/defenceai/.env` свой номер (`ALERT_CHAT_ID=...`, узнать у @userinfobot), напиши боту `/start` и выполни `systemctl restart defenceai`.
+Сообщение приходит один раз при падении и один раз при восстановлении. Проверить вручную: `bash /opt/defenceai/deploy/healthcheck.sh`.
+
 ## Резервные копии
 
 `deploy/install.sh` включает таймер: каждый день в 03:30 база копируется в `/var/backups/defenceai/`

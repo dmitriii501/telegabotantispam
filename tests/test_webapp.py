@@ -209,3 +209,22 @@ async def test_log_marks_dry_run_entries(client):
     )
     data = await (await client.get(f"/api/chat/{CHAT}/log", headers=h())).json()
     assert data["entries"][0]["id"] == entry and data["entries"][0]["executed"] is False
+
+
+async def test_night_mode_settings(client):
+    ok = await client.put(
+        f"/api/chat/{CHAT}/settings", json={"night_mode": True, "night_from": 23, "night_to": 6}, headers=h()
+    )
+    assert ok.status == 200
+    s = (await (await client.get(f"/api/chat/{CHAT}", headers=h())).json())["settings"]
+    assert (s["night_mode"], s["night_from"], s["night_to"]) == (True, 23, 6)
+    for bad in ({"night_from": 24}, {"night_to": -1}, {"night_from": "0"}):
+        assert (await client.put(f"/api/chat/{CHAT}/settings", json=bad, headers=h())).status == 400
+
+
+async def test_health_needs_no_login_and_reports_a_stalled_bot(client):
+    client.adapter.heartbeat = time.time()
+    r = await client.get("/health")
+    assert r.status == 200 and (await r.json())["ok"] is True
+    client.adapter.heartbeat = time.time() - 600
+    assert (await client.get("/health")).status == 503
