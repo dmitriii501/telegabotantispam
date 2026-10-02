@@ -100,10 +100,10 @@ const ICONS = {
 const icon = (name) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ""}</svg>`;
 const KIND_ICON = { prohibition: "x", permission: "check", context: "infoGlyph", everything: "ban" };
 
-// Telegram's own avatar gradients: a person or chat keeps the same color everywhere.
+// Soft impressionist washes (water, lilies, willow, haystacks at dusk): a person keeps the same one everywhere.
 const AVATAR = [
-  ["#ff885e", "#ff516a"], ["#ffcd6a", "#ffa85c"], ["#82b1ff", "#665fff"], ["#a0de7e", "#54cb68"],
-  ["#53edd6", "#28c9b7"], ["#72d5fd", "#2a9ef1"], ["#e0a2f3", "#d669ed"],
+  ["#9fb3e8", "#6f86c9"], ["#e9b3c1", "#c9798f"], ["#a9c9b2", "#6f9a80"], ["#e8cf9c", "#c49a52"],
+  ["#c3b9ea", "#8e82c9"], ["#a7d0d6", "#5f9aa6"], ["#efb9a0", "#cc8063"],
 ];
 
 function avatar(name, seed, size) {
@@ -243,7 +243,7 @@ function renderPicker() {
       <li>Напишите там <b>/rules</b> и правила словами</li></ol>`
   );
   $("#app").innerHTML = `<header class="hero"><div class="who-row">
-      <div class="ava" style="--a1:#72d5fd;--a2:#2a9ef1">${icon("shield")}</div>
+      <div class="ava" style="--a1:#c3b9ea;--a2:#6f86c9">${icon("shield")}</div>
       <div class="meta"><h1>Ваши чаты</h1><div class="tag">Где вы админ и где работает DefenceAi</div></div></div></header>
     <section style="margin-top:14px">${items ? `<div class="group">${items}</div>` : empty}</section>`;
   $("#app").querySelectorAll("[data-chat]").forEach((b) => (b.onclick = () => openChat(Number(b.dataset.chat))));
@@ -504,7 +504,7 @@ async function saveSetting(key, value) {
 // One row of the settings list: a colored icon, a title with a hint, a switch.
 function toggle(key, ico, color, title, hint, danger) {
   const on = state.data.settings[key];
-  return `<div class="set ${danger ? "dangerous" : ""}"><div class="ico" style="background:${color}">${icon(ico)}</div>
+  return `<div class="set ${danger ? "dangerous" : ""}"><div class="ico">${icon(ico)}</div>
     <div class="lbl">${title}<small>${hint}</small></div>
     <label class="sw"><input type="checkbox" data-set="${key}" ${on ? "checked" : ""} aria-label="${title}"><i></i></label></div>`;
 }
@@ -870,10 +870,10 @@ function applyTheme() {
   // Follow the Telegram theme, not the phone's: someone can use dark Telegram on a light phone.
   if (tg && tg.colorScheme) document.documentElement.dataset.theme = tg.colorScheme;
   try {
-    if (tg.isVersionAtLeast && tg.isVersionAtLeast("6.1")) {
-      tg.setHeaderColor("secondary_bg_color");
-      tg.setBackgroundColor("secondary_bg_color");
-    }
+    // Telegram's own bars take the color of the paper, so the page has no visible edge.
+    const paper = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
+    if (tg.isVersionAtLeast && tg.isVersionAtLeast("6.1")) tg.setBackgroundColor(paper);
+    if (tg.isVersionAtLeast && tg.isVersionAtLeast("6.9")) tg.setHeaderColor(paper);
   } catch (_) {
     /* older clients keep their own colors */
   }
