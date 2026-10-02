@@ -77,7 +77,7 @@ async def test_static_page_and_security_headers(client):
 
 async def test_lists_only_chats_where_user_is_admin(client):
     data = await (await client.get("/api/chats", headers=h())).json()
-    assert data["chats"] == [{"chat_id": CHAT, "title": "Мой канал", "enabled": True}]
+    assert data["chats"] == [{"chat_id": CHAT, "title": "Мой канал", "enabled": True, "observe": False}]
     other = await (await client.get("/api/chats", headers=h({"id": 7, "first_name": "X"}))).json()
     assert other["chats"] == []
 

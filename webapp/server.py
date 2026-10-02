@@ -189,15 +189,27 @@ async def list_chats(request: web.Request) -> web.Response:
                     "chat_id": row["chat_id"],
                     "title": await adapter.chat_title(row["chat_id"]),
                     "enabled": bool(row["enabled"]),
+                    "observe": bool(row["observe"]),
                 }
             )
     return web.json_response({"chats": chats})
 
 
+async def day_stats(storage, chat_id: int) -> dict:
+    """Last 24 hours at a glance: shown in the panel header and above the log."""
+    stats = await storage.stats(chat_id, int(time.time()) - 24 * 3600)
+    return {
+        "checked": sum(v for k, v in stats.items() if k != "tokens"),
+        "deleted": sum(stats.get(a, 0) for a in DELETING),
+        "pending": await storage.pending_review_count(chat_id),
+    }
+
+
 async def get_chat(request: web.Request) -> web.Response:
     chat = await admin_chat(request)
-    trusted = await request.app["adapter"].storage.list_trusted(chat["chat_id"])
-    return web.json_response(chat_payload(chat, trusted))
+    storage = request.app["adapter"].storage
+    trusted = await storage.list_trusted(chat["chat_id"])
+    return web.json_response({**chat_payload(chat, trusted), "stats": await day_stats(storage, chat["chat_id"])})
 
 
 async def put_rules(request: web.Request) -> web.Response:
@@ -289,20 +301,13 @@ async def parse_text(request: web.Request) -> web.Response:
 
 
 async def get_log(request: web.Request) -> web.Response:
-    import time
-
     chat = await admin_chat(request)
     storage = request.app["adapter"].storage
     chat_id = chat["chat_id"]
-    stats = await storage.stats(chat_id, int(time.time()) - 24 * 3600)
     entries = await storage.recent_log(chat_id)
     return web.json_response(
         {
-            "stats": {
-                "checked": sum(v for k, v in stats.items() if k != "tokens"),
-                "deleted": sum(stats.get(a, 0) for a in DELETING),
-                "pending": await storage.pending_review_count(chat_id),
-            },
+            "stats": await day_stats(storage, chat_id),
             "entries": [
                 {
                     "id": e["id"],
@@ -324,8 +329,6 @@ async def get_log(request: web.Request) -> web.Response:
 
 
 async def get_insights(request: web.Request) -> web.Response:
-    import time
-
     chat = await admin_chat(request)
     try:
         days = min(max(int(request.query.get("days", "7")), 1), 30)
