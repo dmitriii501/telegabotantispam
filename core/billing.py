@@ -27,6 +27,7 @@ class Plan:
     stars: int  # per 30 days
     checks: int  # AI-read comments per 30 days
     pitch: str
+    rub: int = 0  # the same plan in roubles, paid by card or SBP
 
     @property
     def per_day(self) -> int:
@@ -34,8 +35,8 @@ class Plan:
 
 
 def load_plans() -> dict[str, Plan]:
-    start = Plan("start", "Старт", _env_int("PRICE_START", 399), _env_int("CHECKS_START", 20000), "небольшой канал или чат")
-    pro = Plan("pro", "Про", _env_int("PRICE_PRO", 990), _env_int("CHECKS_PRO", 100000), "большой канал, много комментариев")
+    start = Plan("start", "Старт", _env_int("PRICE_START", 399), _env_int("CHECKS_START", 20000), "небольшой канал или чат", _env_int("PRICE_START_RUB", 790))
+    pro = Plan("pro", "Про", _env_int("PRICE_PRO", 990), _env_int("CHECKS_PRO", 100000), "большой канал, много комментариев", _env_int("PRICE_PRO_RUB", 1990))
     return {p.key: p for p in (start, pro)}
 
 
@@ -50,6 +51,12 @@ def price(plan: Plan, months: int) -> int:
     if months not in TERMS:
         raise ValueError(f"unknown term {months}")
     return round(plan.stars * months * TERMS[months])
+
+
+def price_rub(plan: Plan, months: int) -> int:
+    if months not in TERMS:
+        raise ValueError(f"unknown term {months}")
+    return round(plan.rub * months * TERMS[months])
 
 
 @dataclass(frozen=True)

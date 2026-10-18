@@ -101,6 +101,22 @@ CREATE TABLE IF NOT EXISTS payments (
     stars INTEGER NOT NULL,
     refunded INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS orders (
+    order_id TEXT PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    payer_id INTEGER NOT NULL,
+    plan TEXT NOT NULL,
+    months INTEGER NOT NULL,
+    amount INTEGER NOT NULL,  -- roubles
+    email TEXT,
+    payment_id TEXT,
+    status TEXT NOT NULL DEFAULT 'new'
+);
+CREATE TABLE IF NOT EXISTS payers (
+    user_id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS reports (
     chat_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
@@ -193,6 +209,7 @@ class Storage:
         await self._add_missing_columns("log", LOG_COLUMNS)
         await self._add_missing_columns("trusted", [("name", "TEXT NOT NULL DEFAULT ''")])
         await self._add_missing_columns("posts", [("ts", "INTEGER")])
+        await self._add_missing_columns("payments", [("currency", "TEXT NOT NULL DEFAULT 'XTR'"), ("email", "TEXT")])
         # Chats that existed before the trial was introduced start their trial now.
         await self.db.execute(
             "UPDATE chats SET trial_until = ? WHERE trial_until IS NULL", (int(time.time()) + TRIAL_DAYS * DAY,)
@@ -585,12 +602,16 @@ class Storage:
         ) as cur:
             return (await cur.fetchone())[0]
 
-    async def record_payment(self, charge_id: str, chat_id: int, payer_id: int, plan: str, months: int, stars: int) -> bool:
+    async def record_payment(
+        self, charge_id: str, chat_id: int, payer_id: int, plan: str, months: int, stars: int,
+        currency: str = "XTR", email: str | None = None,
+    ) -> bool:
         """Save a payment and extend the chat's access. False when this charge was already processed
         (Telegram may deliver the same notice twice)."""
         cur = await self.db.execute(
-            "INSERT OR IGNORE INTO payments (charge_id, ts, chat_id, payer_id, plan, months, stars) VALUES (?,?,?,?,?,?,?)",
-            (charge_id, int(time.time()), chat_id, payer_id, plan, months, stars),
+            "INSERT OR IGNORE INTO payments (charge_id, ts, chat_id, payer_id, plan, months, stars, currency, email)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (charge_id, int(time.time()), chat_id, payer_id, plan, months, stars, currency, email),
         )
         if cur.rowcount != 1:
             await self.db.commit()
@@ -635,11 +656,50 @@ class Storage:
         await self.db.commit()
 
     async def revenue(self, since: int = 0) -> dict:
+        """Payments and money per currency: {"payments": n, "stars": ..., "rub": ...}."""
         async with self.db.execute(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(stars), 0) AS stars FROM payments WHERE ts >= ? AND refunded = 0", (since,)
+            "SELECT currency, COUNT(*) AS n, COALESCE(SUM(stars), 0) AS total FROM payments"
+            " WHERE ts >= ? AND refunded = 0 GROUP BY currency",
+            (since,),
         ) as cur:
+            rows = await cur.fetchall()
+        result = {"payments": 0, "stars": 0, "rub": 0}
+        for row in rows:
+            result["payments"] += row["n"]
+            result["rub" if row["currency"] == "RUB" else "stars"] += row["total"]
+        return result
+
+    # --- orders paid in roubles (T-Bank) ---
+
+    async def create_order(self, order_id: str, chat_id: int, payer_id: int, plan: str, months: int, amount: int, email: str) -> None:
+        await self.db.execute(
+            "INSERT INTO orders (order_id, ts, chat_id, payer_id, plan, months, amount, email) VALUES (?,?,?,?,?,?,?,?)",
+            (order_id, int(time.time()), chat_id, payer_id, plan, months, amount, email),
+        )
+        await self.db.commit()
+
+    async def get_order(self, order_id: str) -> aiosqlite.Row | None:
+        async with self.db.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)) as cur:
+            return await cur.fetchone()
+
+    async def set_order(self, order_id: str, status: str, payment_id: str | None = None) -> None:
+        await self.db.execute(
+            "UPDATE orders SET status = ?, payment_id = COALESCE(?, payment_id) WHERE order_id = ?",
+            (status, payment_id, order_id),
+        )
+        await self.db.commit()
+
+    async def get_email(self, user_id: int) -> str | None:
+        async with self.db.execute("SELECT email FROM payers WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
-        return {"payments": row["n"], "stars": row["stars"]}
+        return row["email"] if row else None
+
+    async def set_email(self, user_id: int, email: str | None) -> None:
+        if email:
+            await self.db.execute("INSERT OR REPLACE INTO payers (user_id, email) VALUES (?, ?)", (user_id, email))
+        else:
+            await self.db.execute("DELETE FROM payers WHERE user_id = ?", (user_id,))
+        await self.db.commit()
 
     async def set_billing_notice(self, chat_id: int, key: str) -> None:
         await self.db.execute("UPDATE chats SET billing_notice = ? WHERE chat_id = ?", (key, chat_id))
@@ -663,6 +723,7 @@ class Storage:
         cur = await self.db.execute("DELETE FROM log WHERE ts < ?", (cutoff,))
         await self.db.execute("DELETE FROM appeals WHERE ts < ?", (cutoff,))
         await self.db.execute("DELETE FROM reports WHERE ts < ?", (cutoff,))
+        await self.db.execute("DELETE FROM orders WHERE ts < ? AND status = 'new'", (cutoff,))
         await self.db.execute("DELETE FROM profiles WHERE fetched_at < ?", (cutoff,))
         await self.db.execute("DELETE FROM ocr_cache WHERE ts < ?", (cutoff,))
         await self.db.commit()

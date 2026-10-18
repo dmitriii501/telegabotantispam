@@ -8,6 +8,7 @@ import html
 import logging
 import os
 import re
+import secrets
 import time
 from datetime import datetime
 
@@ -24,15 +25,17 @@ from aiogram.types import (
     PreCheckoutQuery,
 )
 
-from core.billing import DAY, PERIOD_DAYS, PLANS, TERMS, TRIAL_DAYS, Access, access, price
+from core.billing import DAY, PERIOD_DAYS, PLANS, TERMS, TRIAL_DAYS, Access, access, price, price_rub
 from core.models import DELETING_ACTIONS
 from core.moderation import MOSCOW
+from core.tbank import EMAIL, TBank, TBankError, kopecks
 
 log = logging.getLogger(__name__)
 
 USAGE_TTL = 120  # seconds the cached count of AI checks may be old
 EXPIRED_ALERT_COOLDOWN = 3 * DAY
 LIMIT_ALERT_COOLDOWN = DAY
+EMAIL_WAIT = 15 * 60  # seconds a customer has to send the e-mail for the receipt
 REMIND_DAYS = (3, 1)  # warn this many days before the end
 
 PAYSUPPORT_TEXT = (
@@ -49,6 +52,13 @@ def stars(n: int) -> str:
 
 def number(n: int) -> str:
     return f"{n:,}".replace(",", " ")
+
+
+def money(r: dict) -> str:
+    parts = [f"{r['rub']:,} ₽".replace(",", " ")] if r.get("rub") else []
+    if r.get("stars") or not parts:
+        parts.append(stars(r.get("stars", 0)))
+    return " и ".join(parts)
 
 
 def date_text(ts: int) -> str:
@@ -73,6 +83,8 @@ class PaymentsMixin:
         ids = os.getenv("OPERATOR_IDS") or os.getenv("ALERT_CHAT_ID") or ""
         self.operators = {int(x) for x in re.split(r"[,\s]+", ids) if x.strip().lstrip("-").isdigit()}
         self.support_contact = os.getenv("SUPPORT_CONTACT", "").strip() or "владельцу сервиса"
+        self.tbank = TBank.from_env()  # None until the terminal keys are in .env: then only Stars are offered
+        self._awaiting_email: dict[int, tuple[int, str, int, float]] = {}
 
     def _register_payments(self, r) -> None:
         private = F.chat.type == ChatType.PRIVATE
@@ -83,6 +95,10 @@ class PaymentsMixin:
         r.message(Command("revenue"), private)(self.on_revenue)
         r.callback_query(F.data.startswith("plan:"))(self.on_plan_button)
         r.callback_query(F.data.startswith("buy:"))(self.on_buy_button)
+        r.callback_query(F.data.startswith("pm:"))(self.on_method_button)
+        r.callback_query(F.data.startswith("rub:"))(self.on_rub_button)
+        r.message(Command("email"), private)(self.on_email_command)
+        r.message(private, F.text, self.waiting_for_email)(self.on_email_message)
         r.pre_checkout_query()(self.on_pre_checkout)
         r.message(F.successful_payment)(self.on_paid)
 
@@ -197,7 +213,8 @@ class PaymentsMixin:
         await self.show_plans(message.from_user.id, chat_id)
         return True
 
-    async def show_plans(self, user_id: int, chat_id: int) -> None:
+    async def show_plans(self, user_id: int, chat_id: int, method: str | None = None) -> None:
+        """The plans and, when roubles are connected, first the choice between card and Stars."""
         chat = await self.storage.get_chat(chat_id)
         if not chat:
             return
@@ -205,26 +222,42 @@ class PaymentsMixin:
         title = html.escape(await self.chat_title(chat_id))
         lines = [f"💳 <b>Тариф для чата «{title}»</b>", self.access_text(acc), ""]
         for plan in PLANS.values():
+            cost = f"{plan.rub:,} ₽ или {stars(plan.stars)}".replace(",", " ") if self.tbank else stars(plan.stars)
             lines.append(
-                f"<b>{plan.title}</b>: {stars(plan.stars)} в месяц. До {number(plan.checks)} комментариев в месяц "
+                f"<b>{plan.title}</b>: {cost} в месяц. До {number(plan.checks)} комментариев в месяц "
                 f"с ИИ-разбором (около {number(plan.per_day)} в день): {plan.pitch}."
             )
-        lines += [
-            "",
-            "Оплата звёздами Telegram. Месяц — 30 дней. За 3 месяца скидка 10%, за год 25%.",
-            "Правила, настройки и журнал сохраняются при любом сроке.",
-        ]
+        lines += ["", "Месяц — 30 дней. За 3 месяца скидка 10%, за год 25%. Правила, настройки и журнал сохраняются при любом сроке."]
         if acc.state == "paid":
             lines.append("Продление того же тарифа добавляет время к оставшемуся. Смена тарифа начинает новый срок с сегодняшнего дня.")
-        rows = []
-        for plan in PLANS.values():
-            for months in TERMS:
-                label = {1: "1 месяц", 3: "3 месяца", 12: "12 месяцев"}[months]
-                rows.append([InlineKeyboardButton(
-                    text=f"{plan.title} · {label} — {stars(price(plan, months))}",
-                    callback_data=f"buy:{chat_id}:{plan.key}:{months}",
-                )])
+        if self.tbank and method is None:
+            lines.append("\nКак оплатить?")
+            rows = [
+                [InlineKeyboardButton(text="💳 Картой или СБП, в рублях", callback_data=f"pm:{chat_id}:rub")],
+                [InlineKeyboardButton(text="⭐ Звёздами Telegram", callback_data=f"pm:{chat_id}:stars")],
+            ]
+        else:
+            method = method or "stars"
+            lines.append("\n" + ("Оплата картой или через СБП. Чек придёт на почту." if method == "rub" else "Оплата звёздами Telegram."))
+            rows = []
+            for plan in PLANS.values():
+                for months in TERMS:
+                    label = {1: "1 месяц", 3: "3 месяца", 12: "12 месяцев"}[months]
+                    cost = f"{price_rub(plan, months):,} ₽".replace(",", " ") if method == "rub" else stars(price(plan, months))
+                    rows.append([InlineKeyboardButton(
+                        text=f"{plan.title} · {label} — {cost}",
+                        callback_data=f"{'rub' if method == 'rub' else 'buy'}:{chat_id}:{plan.key}:{months}",
+                    )])
         await self.dm(user_id, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+
+    async def on_method_button(self, call: CallbackQuery) -> None:
+        _, chat_id, method = call.data.split(":")
+        chat_id = int(chat_id)
+        if method not in ("rub", "stars") or not await self.is_admin(chat_id, call.from_user.id, fresh=True):
+            await call.answer("Оплатить может только админ этого чата.", show_alert=True)
+            return
+        await self.show_plans(call.from_user.id, chat_id, method)
+        await call.answer()
 
     async def on_paysupport(self, message: Message) -> None:
         await message.answer(PAYSUPPORT_TEXT.format(contact=html.escape(self.support_contact)))
@@ -280,6 +313,27 @@ class PaymentsMixin:
                 problem = "Чат не найден. Добавьте бота в чат и повторите."
         await query.answer(ok=problem is None, error_message=problem)
 
+    async def complete_payment(
+        self, charge_id: str, chat_id: int, payer_id: int, plan_key: str, months: int, amount: int, currency: str, email: str | None = None
+    ) -> str | None:
+        """Record a payment, open the access and tell the operators. Returns the thank-you text,
+        or None when this charge was already processed (the bank or Telegram may send a notice twice)."""
+        fresh = await self.storage.record_payment(charge_id, chat_id, payer_id, plan_key, months, amount, currency, email)
+        if not fresh:
+            return None
+        self._usage.pop(chat_id, None)
+        chat = await self.storage.get_chat(chat_id)
+        acc = await self.access_for(chat)
+        title = html.escape(await self.chat_title(chat_id))
+        shown = f"{amount:,} ₽".replace(",", " ") if currency == "RUB" else stars(amount)
+        for operator in self.operators:
+            await self.dm(operator, f"💰 Оплата: {shown}, «{PLANS[plan_key].title}» на {months} мес., чат «{title}»")
+        log.info("payment chat=%s plan=%s months=%s amount=%s %s", chat_id, plan_key, months, amount, currency)
+        return (
+            f"✅ Спасибо! Тариф «{PLANS[plan_key].title}» для чата «{title}» оплачен до {date_text(acc.until)}.\n"
+            "Правила и настройки на месте, ИИ-проверка работает. Вопросы по оплате: /paysupport"
+        )
+
     async def on_paid(self, message: Message) -> None:
         pay = message.successful_payment
         parsed = self.parse_payload(pay.invoice_payload)
@@ -288,22 +342,130 @@ class PaymentsMixin:
             await message.answer("Платёж получен, но я не смог его привязать к чату. Напишите /paysupport, всё исправим.")
             return
         chat_id, plan_key, months = parsed
-        fresh = await self.storage.record_payment(
-            pay.telegram_payment_charge_id, chat_id, message.from_user.id, plan_key, months, pay.total_amount
+        thanks = await self.complete_payment(
+            pay.telegram_payment_charge_id, chat_id, message.from_user.id, plan_key, months, pay.total_amount, "XTR"
         )
-        if not fresh:
-            return  # the same notice again
-        self._usage.pop(chat_id, None)
-        chat = await self.storage.get_chat(chat_id)
-        acc = await self.access_for(chat)
-        title = html.escape(await self.chat_title(chat_id))
-        await message.answer(
-            f"✅ Спасибо! Тариф «{PLANS[plan_key].title}» для чата «{title}» оплачен до {date_text(acc.until)}.\n"
-            "Правила и настройки на месте, ИИ-проверка работает. Вопросы по оплате: /paysupport"
+        if thanks:
+            await message.answer(thanks)
+
+    # ------------------------------------------------------- roubles (T-Bank)
+
+    async def waiting_for_email(self, message: Message) -> bool:
+        entry = self._awaiting_email.get(message.from_user.id) if message.from_user else None
+        if not entry or time.time() - entry[3] > EMAIL_WAIT:
+            return False
+        return not (message.text or "").startswith("/")
+
+    async def on_rub_button(self, call: CallbackQuery) -> None:
+        parsed = self.parse_payload(call.data.split(":", 1)[1])
+        if not parsed or not self.tbank:
+            await call.answer("Оплата картой пока недоступна. Выберите звёзды или напишите /paysupport.", show_alert=True)
+            return
+        chat_id, plan_key, months = parsed
+        user_id = call.from_user.id
+        if not await self.is_admin(chat_id, user_id, fresh=True):
+            await call.answer("Оплатить может только админ этого чата.", show_alert=True)
+            return
+        await call.answer()
+        email = await self.storage.get_email(user_id)
+        if email:
+            await self.start_rub_payment(user_id, chat_id, plan_key, months, email)
+            return
+        self._awaiting_email[user_id] = (chat_id, plan_key, months, time.time())
+        await self.dm(
+            user_id,
+            "Для оплаты нужен e-mail: на него придёт кассовый чек (так требует закон). Пришлите адрес одним сообщением. "
+            "Он нужен только для чека.",
         )
-        for operator in self.operators:
-            await self.dm(operator, f"💰 Оплата: {stars(pay.total_amount)}, «{PLANS[plan_key].title}» на {months} мес., чат «{title}»")
-        log.info("payment chat=%s plan=%s months=%s stars=%s", chat_id, plan_key, months, pay.total_amount)
+
+    async def on_email_message(self, message: Message) -> None:
+        user_id = message.from_user.id
+        email = (message.text or "").strip()
+        if not EMAIL.match(email):
+            await message.answer("Не похоже на e-mail. Пришлите адрес ещё раз, например name@mail.ru")
+            return
+        chat_id, plan_key, months, _ = self._awaiting_email.pop(user_id)
+        await self.storage.set_email(user_id, email)
+        await self.start_rub_payment(user_id, chat_id, plan_key, months, email)
+
+    async def on_email_command(self, message: Message, command: CommandObject) -> None:
+        """/email shows the e-mail used for receipts, /email name@mail.ru changes it, /email delete forgets it."""
+        user_id = message.from_user.id
+        arg = (command.args or "").strip()
+        if arg in ("delete", "удалить"):
+            await self.storage.set_email(user_id, None)
+            await message.answer("Адрес для чеков удалён.")
+        elif arg:
+            if not EMAIL.match(arg):
+                await message.answer("Не похоже на e-mail. Пример: <code>/email name@mail.ru</code>")
+                return
+            await self.storage.set_email(user_id, arg)
+            await message.answer(f"Чеки будут приходить на {html.escape(arg)}.")
+        else:
+            current = await self.storage.get_email(user_id)
+            await message.answer(
+                f"Чеки приходят на {html.escape(current)}. Сменить: <code>/email name@mail.ru</code>, забыть: <code>/email delete</code>"
+                if current
+                else "Адрес для чеков пока не задан: бот спросит его при первой оплате. Задать сразу: <code>/email name@mail.ru</code>"
+            )
+
+    async def start_rub_payment(self, user_id: int, chat_id: int, plan_key: str, months: int, email: str) -> None:
+        plan = PLANS[plan_key]
+        amount = price_rub(plan, months)
+        order_id = secrets.token_hex(8)
+        await self.storage.create_order(order_id, chat_id, user_id, plan_key, months, amount, email)
+        description = f"DefenceAi «{plan.title}», {months} мес."
+        site = os.getenv("WEBAPP_URL", "").rstrip("/")
+        try:
+            payment_id, url = await self.tbank.create_payment(
+                order_id,
+                kopecks(amount),
+                description,
+                email,
+                notify_url=f"{site}/tbank/notify" if site else None,
+                success_url=f"https://t.me/{self.bot_username}" if self.bot_username else None,
+            )
+        except TBankError as e:
+            log.error("T-Bank refused to create a payment: %s", e)
+            await self.dm(user_id, f"Не получилось создать счёт: {html.escape(str(e))}. Попробуйте звёзды или напишите /paysupport.")
+            return
+        await self.storage.set_order(order_id, "sent", payment_id)
+        await self.dm(
+            user_id,
+            f"К оплате: <b>{amount:,} ₽</b> за тариф «{plan.title}», {months} мес.".replace(",", " ")
+            + f"\nОплатить можно картой или через СБП. Чек придёт на {html.escape(email)} (сменить: /email)."
+            "\nПосле оплаты срок продлится сам, ничего нажимать не нужно.",
+            link_button(f"Оплатить {amount:,} ₽".replace(",", " "), url),
+        )
+
+    async def handle_tbank_notification(self, data: dict) -> bool:
+        """The bank tells us about a payment. False only when the signature is wrong (answered with an error,
+        so the bank does not treat it as delivered); everything else is answered OK, also what we ignore."""
+        if not self.tbank or not self.tbank.verify(data):
+            log.warning("T-Bank notification with a bad signature for order %r", data.get("OrderId"))
+            return False
+        order = await self.storage.get_order(str(data.get("OrderId")))
+        if not order:
+            log.warning("T-Bank notification for an unknown order %r", data.get("OrderId"))
+            return True
+        status, payment_id = data.get("Status"), str(data.get("PaymentId"))
+        charge_id = f"tbank:{payment_id}"
+        if status == "CONFIRMED" and data.get("Success") in (True, "true"):
+            if int(data.get("Amount") or 0) != kopecks(order["amount"]):
+                log.error("T-Bank paid %s kopecks for order %s that costs %s roubles", data.get("Amount"), order["order_id"], order["amount"])
+                return True
+            thanks = await self.complete_payment(
+                charge_id, order["chat_id"], order["payer_id"], order["plan"], order["months"], order["amount"], "RUB", order["email"]
+            )
+            await self.storage.set_order(order["order_id"], "paid", payment_id)
+            if thanks:
+                await self.dm(order["payer_id"], thanks)
+        elif status in ("REFUNDED", "PARTIAL_REFUNDED", "REVERSED"):
+            await self.storage.mark_refunded(charge_id)
+            await self.storage.set_order(order["order_id"], status.lower(), payment_id)
+        elif status in ("REJECTED", "CANCELED", "DEADLINE_EXPIRED", "AUTH_FAIL"):
+            await self.storage.set_order(order["order_id"], status.lower(), payment_id)
+        return True
 
     # ---------------------------------------------------------- the operator's tools
 
@@ -340,13 +502,23 @@ class PaymentsMixin:
             await message.answer("Платёж не найден или уже возвращён. Формат: <code>/refund номер_платежа</code>")
             return
         try:
-            await self.bot.refund_star_payment(user_id=payment["payer_id"], telegram_payment_charge_id=charge_id)
-        except TelegramAPIError as e:
-            await message.answer(f"Telegram отказал: {html.escape(str(e))}")
+            if payment["currency"] == "RUB":
+                if not self.tbank:
+                    raise TBankError("терминал Т-Банка не подключён")
+                await self.tbank.cancel(
+                    charge_id.removeprefix("tbank:"), kopecks(payment["stars"]),
+                    f"DefenceAi «{PLANS[payment['plan']].title}», {payment['months']} мес.", payment["email"],
+                )
+                given = f"{payment['stars']:,} ₽".replace(",", " ")
+            else:
+                await self.bot.refund_star_payment(user_id=payment["payer_id"], telegram_payment_charge_id=charge_id)
+                given = stars(payment["stars"])
+        except (TelegramAPIError, TBankError) as e:
+            await message.answer(f"Не получилось вернуть деньги: {html.escape(str(e))}")
             return
         await self.storage.mark_refunded(charge_id)
         self._usage.pop(payment["chat_id"], None)
-        await message.answer(f"Возвращено {stars(payment['stars'])}, срок уменьшен на {payment['months']} мес.")
+        await message.answer(f"Возвращено {given}, срок уменьшен на {payment['months']} мес.")
 
     async def on_revenue(self, message: Message) -> None:
         if not self.is_operator(message):
@@ -358,8 +530,8 @@ class PaymentsMixin:
         for chat in chats:
             states[access(chat, 0).state] += 1
         await message.answer(
-            f"💰 За 30 дней: {stars(month['stars'])} ({month['payments']} платежей)\n"
-            f"Всего: {stars(total['stars'])} ({total['payments']} платежей)\n"
+            f"💰 За 30 дней: {money(month)} ({month['payments']} платежей)\n"
+            f"Всего: {money(total)} ({total['payments']} платежей)\n"
             f"Чатов: платят {states['paid']}, на пробе {states['trial']}, закончилось {states['expired']}"
         )
 

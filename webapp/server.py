@@ -175,6 +175,16 @@ async def health(request: web.Request) -> web.Response:
     return web.json_response({"ok": age < 180, "heartbeat_age": int(age), "jev": bool(jev)}, status=200 if age < 180 else 503)
 
 
+async def tbank_notify(request: web.Request) -> web.Response:
+    """The bank's notification about a payment. It is public by nature: trusted only after the signature check."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return web.Response(text="bad request", status=400)
+    ok = isinstance(data, dict) and await request.app["adapter"].handle_tbank_notification(data)
+    return web.Response(text="OK" if ok else "bad signature", status=200 if ok else 400)
+
+
 async def index(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(STATIC / "index.html")
 
@@ -436,6 +446,7 @@ def create_app(adapter, bot_token: str) -> web.Application:
     app["token"] = bot_token
     app.router.add_get("/", index)
     app.router.add_get("/health", health)
+    app.router.add_post("/tbank/notify", tbank_notify)
     app.router.add_static("/static", STATIC)
     app.router.add_get("/api/chats", list_chats)
     app.router.add_get("/api/chat/{chat_id}", get_chat)

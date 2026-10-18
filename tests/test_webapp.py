@@ -244,3 +244,14 @@ async def test_plan_columns_cannot_be_changed_through_settings(client):
     for key in ("plan", "paid_until", "trial_until"):
         r = await client.put(f"/api/chat/{CHAT}/settings", json={key: 1}, headers=h())
         assert r.status == 400
+
+
+async def test_bank_notification_route_needs_no_login_but_the_signature_decides(client):
+    client.adapter.handle_tbank_notification = AsyncMock(return_value=True)
+    r = await client.post("/tbank/notify", json={"OrderId": "x"})
+    assert r.status == 200 and await r.text() == "OK"
+    client.adapter.handle_tbank_notification = AsyncMock(return_value=False)
+    r = await client.post("/tbank/notify", json={"OrderId": "x"})
+    assert r.status == 400
+    assert (await client.post("/tbank/notify", data="not json")).status == 400
+    assert (await client.post("/tbank/notify", json=[1, 2])).status == 400
