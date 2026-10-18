@@ -10,6 +10,8 @@ import hmac
 import logging
 import os
 import re
+import ssl
+from functools import lru_cache
 
 import aiohttp
 
@@ -19,8 +21,29 @@ API_URL = os.getenv("TBANK_API_URL", "https://securepay.tinkoff.ru/v2").rstrip("
 EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s.]{2,}$")
 
 
+DEFAULT_CA_FILE = "/etc/defenceai/russian_trusted_root_ca.pem"
+
+
 class TBankError(Exception):
     pass
+
+
+@lru_cache(maxsize=4)
+def _context(path: str) -> ssl.SSLContext:
+    context = ssl.create_default_context()  # the usual system roots stay trusted
+    try:
+        context.load_verify_locations(cafile=path)  # and, for the bank only, the Russian Trusted Root CA
+    except FileNotFoundError:
+        pass  # not installed on this machine: the usual roots are enough, if the bank's certificate allows
+    except (ssl.SSLError, OSError) as e:
+        log.warning("Cannot use the CA file %s, the system roots only: %s", path, e)
+    return context
+
+
+def ssl_context() -> ssl.SSLContext:
+    """Verification is never switched off. The file path comes from TBANK_CA_FILE and lives outside the
+    application folder, so updating the bot does not touch it."""
+    return _context(os.getenv("TBANK_CA_FILE", DEFAULT_CA_FILE))
 
 
 def sign(params: dict, password: str) -> str:
@@ -111,7 +134,8 @@ class TBank:
 
     async def _post(self, method: str, payload: dict) -> dict:
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            connector = aiohttp.TCPConnector(ssl=ssl_context())
+            async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=20)) as session:
                 async with session.post(f"{API_URL}/{method}", json=payload) as response:
                     data = await response.json(content_type=None)
         except (aiohttp.ClientError, TimeoutError, ValueError) as e:

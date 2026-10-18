@@ -272,3 +272,48 @@ async def test_email_command(env):
     assert await env.storage.get_email(ADMIN) == "x@y.ru"
     await adapter.on_email_command(m, CommandObject(prefix="/", command="email", args="delete"))
     assert await env.storage.get_email(ADMIN) is None
+
+
+# ------------------------------------------------------------------ certificates
+
+
+def make_ca(tmp_path):
+    import subprocess
+
+    pem = tmp_path / "ca.pem"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(tmp_path / "k.pem"), "-out", str(pem),
+         "-days", "2", "-subj", "/CN=Test Root CA", "-addext", "basicConstraints=critical,CA:TRUE"],
+        check=True, capture_output=True,
+    )
+    return pem
+
+
+def test_the_extra_root_is_added_and_verification_stays_on(tmp_path, monkeypatch):
+    import ssl
+
+    from core import tbank
+
+    tbank._context.cache_clear()
+    monkeypatch.setenv("TBANK_CA_FILE", str(tmp_path / "missing.pem"))
+    plain = tbank.ssl_context()
+    assert plain.verify_mode == ssl.CERT_REQUIRED and plain.check_hostname
+    pem = make_ca(tmp_path)
+    monkeypatch.setenv("TBANK_CA_FILE", str(pem))
+    extended = tbank.ssl_context()
+    assert extended.verify_mode == ssl.CERT_REQUIRED and extended.check_hostname
+    assert any(c["subject"][0][0][1] == "Test Root CA" for c in extended.get_ca_certs())
+    assert not any(c["subject"][0][0][1] == "Test Root CA" for c in plain.get_ca_certs())
+
+
+def test_a_broken_ca_file_does_not_break_payments(tmp_path, monkeypatch):
+    import ssl
+
+    from core import tbank
+
+    tbank._context.cache_clear()
+    junk = tmp_path / "junk.pem"
+    junk.write_text("not a certificate")
+    monkeypatch.setenv("TBANK_CA_FILE", str(junk))
+    context = tbank.ssl_context()
+    assert context.verify_mode == ssl.CERT_REQUIRED
