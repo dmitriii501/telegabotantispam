@@ -25,7 +25,7 @@ from aiogram.types import (
     PreCheckoutQuery,
 )
 
-from core.billing import DAY, PERIOD_DAYS, PLANS, TERMS, TRIAL_DAYS, Access, access, price, price_rub
+from core.billing import DAY, PERIOD_DAYS, PLANS, REFUND_DAYS, TERMS, TRIAL_DAYS, Access, access, price, price_rub
 from core.models import DELETING_ACTIONS
 from core.moderation import MOSCOW
 from core.tbank import EMAIL, TBank, TBankError, kopecks
@@ -42,7 +42,7 @@ PAYSUPPORT_TEXT = (
     "💬 <b>Вопросы по оплате</b>\n\n"
     "Платёж прошёл, а доступ не появился? Или сервис не подошёл и нужен возврат?\n"
     "Напишите {contact} и пришлите номер платежа из чека Telegram.\n"
-    "Если сервис не подошёл, вернём Stars в течение 7 дней после оплаты."
+    "Если сервис не подошёл, вернём деньги в течение {days} дней после оплаты (условия в оферте: {site}/offer)."
 )
 
 
@@ -260,7 +260,9 @@ class PaymentsMixin:
         await call.answer()
 
     async def on_paysupport(self, message: Message) -> None:
-        await message.answer(PAYSUPPORT_TEXT.format(contact=html.escape(self.support_contact)))
+        await message.answer(PAYSUPPORT_TEXT.format(
+            contact=html.escape(self.support_contact), days=REFUND_DAYS, site=os.getenv("WEBAPP_URL", "").rstrip("/")
+        ))
 
     # ----------------------------------------------------------------- payment
 

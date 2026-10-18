@@ -43,6 +43,7 @@ def load_plans() -> dict[str, Plan]:
 PLANS = load_plans()
 TRIAL_DAYS = _env_int("TRIAL_DAYS", 14)
 TRIAL_CHECKS = _env_int("CHECKS_TRIAL", 10000)
+REFUND_DAYS = _env_int("REFUND_DAYS", 7)  # money back, no questions, within this many days of a payment
 # months -> price multiplier: the longer the term, the cheaper a month
 TERMS = {1: 1.0, 3: 0.9, 12: 0.75}
 

@@ -213,7 +213,7 @@ HELP_TEXT = (
     "/firststrict on|off — новички, написавшие в первые 2 минуты после поста (так боты занимают первое место), проверяются строже\n"
     "/spam — участники отвечают этой командой на плохой комментарий; после 3 жалоб бот спросит владельца\n"
     "/plan — тариф, оставшийся срок и оплата\n"
-    "/privacy — какие данные хранит бот\n"
+    "/privacy — какие данные хранит бот, /offer — оферта\n"
     "/night on|off|0 7 — ночью (часы по Москве) проверка строже, а новичкам нельзя ссылки\n"
     "/antiraid on|off — предупреждать о массовых заходах; /cleanservice on|off — убирать «вошёл» и «вышел»\n"
     "/ocr on|off — читать текст на картинках и стикерах новичков (рекламу в виде картинки)\n"
@@ -546,7 +546,7 @@ class TelegramAdapter(PaymentsMixin):
     def panel_markup(self, chat_id: int | None = None) -> InlineKeyboardMarkup | None:
         if not self.webapp_url:
             return None
-        url = f"{self.webapp_url}/" + (f"?chat={chat_id}" if chat_id else "")
+        url = f"{self.webapp_url}/app/" + (f"?chat={chat_id}" if chat_id else "")
         return InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="⚙️ Открыть панель", web_app=WebAppInfo(url=url))]]
         )
@@ -556,7 +556,7 @@ class TelegramAdapter(PaymentsMixin):
             return
         try:
             await self.bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(text="Панель", web_app=WebAppInfo(url=f"{self.webapp_url}/"))
+                menu_button=MenuButtonWebApp(text="Панель", web_app=WebAppInfo(url=f"{self.webapp_url}/app/"))
             )
         except TelegramAPIError as e:
             log.warning("Cannot set menu button: %s", e)
@@ -577,6 +577,7 @@ class TelegramAdapter(PaymentsMixin):
         r.message(CommandStart(), F.chat.type == ChatType.PRIVATE)(self.on_start)
         self._register_payments(r)
         r.message(Command("privacy"))(self.on_privacy)
+        r.message(Command("offer"))(self.on_offer)
         r.my_chat_member()(self.on_bot_added)
         r.message(Command("rules"), GROUPS)(self.on_rules)
         r.message(Command("stats"), GROUPS)(self.on_stats)
@@ -624,7 +625,14 @@ class TelegramAdapter(PaymentsMixin):
         await message.answer(HELP_TEXT, reply_markup=self.panel_markup())
 
     async def on_privacy(self, message: Message) -> None:
-        await message.answer(PRIVACY_TEXT)
+        site = self.webapp_url
+        await message.answer(PRIVACY_TEXT + (f"\n\nПолный текст: {site}/privacy" if site else ""))
+
+    async def on_offer(self, message: Message) -> None:
+        if self.webapp_url:
+            await message.answer(f"Публичная оферта: {self.webapp_url}/offer\nПолитика конфиденциальности: {self.webapp_url}/privacy")
+        else:
+            await message.answer("Оферта пока не опубликована.")
 
     async def on_help(self, message: Message) -> None:
         await message.answer(HELP_TEXT, reply_markup=self.panel_markup() if message.chat.type == ChatType.PRIVATE else None)

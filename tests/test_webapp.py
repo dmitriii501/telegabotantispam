@@ -322,7 +322,7 @@ async def test_the_pay_endpoint_rejects_bad_requests_and_strangers(client):
 
 
 async def test_every_script_of_the_panel_is_served(client):
-    page = await (await client.get("/")).text()
+    page = await (await client.get("/app/")).text()
     scripts = [part.split('"')[0] for part in page.split('src="/static/')[1:]]
     assert {"core.js", "shell.js", "home.js", "settings.js", "pay.js", "rules.js", "insights.js", "log.js", "app.js"} <= set(scripts)
     for name in scripts:

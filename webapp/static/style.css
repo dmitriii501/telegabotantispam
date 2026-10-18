@@ -325,6 +325,7 @@ textarea.paste:focus{box-shadow:0 0 0 1.5px var(--accent-soft)}
 .summary span{font-size:14px}
 .summary b{font-family:var(--serif);font-size:26px;font-weight:500;white-space:nowrap}
 .center{text-align:center;margin:10px 8px 0}
+.linkbtn{border:0;background:none;color:var(--accent);font:inherit;padding:0;cursor:pointer;text-decoration:underline}
 .state-box{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;padding:40px 8px}
 .state-box b{font-family:var(--serif);font-size:24px;font-weight:500}
 .state-box .btn{max-width:320px}

@@ -21,6 +21,7 @@ from core.jev_client import JevError
 from core.tbank import EMAIL, TBankError
 from core.models import DELETING_ACTIONS, ActionType
 from core.links import MAX_ENTRIES, normalize_entry
+from webapp import legal
 from core.moderation import MODES, ChatConfig
 from core.rules import ACTIONS, CONTEXT, EVERYTHING, PERMISSION, PROHIBITION, Rule, rules_to_json
 from webapp.auth import validate_init_data
@@ -190,6 +191,18 @@ async def tbank_notify(request: web.Request) -> web.Response:
 
 async def index(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(STATIC / "index.html")
+
+
+def bot_name(request: web.Request) -> str:
+    name = getattr(request.app["adapter"], "bot_username", None)
+    return name if isinstance(name, str) and name else "DefenceAiBot"
+
+
+def html_page(make):
+    async def handler(request: web.Request) -> web.Response:
+        return web.Response(text=make(bot_name(request)), content_type="text/html")
+
+    return handler
 
 
 async def list_chats(request: web.Request) -> web.Response:
@@ -493,7 +506,11 @@ def create_app(adapter, bot_token: str) -> web.Application:
     app = web.Application(middlewares=[security_headers, errors, auth], client_max_size=64 * 1024)
     app["adapter"] = adapter
     app["token"] = bot_token
-    app.router.add_get("/", index)
+    app.router.add_get("/", html_page(legal.landing))
+    app.router.add_get("/offer", html_page(legal.offer))
+    app.router.add_get("/privacy", html_page(legal.privacy))
+    app.router.add_get("/app", index)
+    app.router.add_get("/app/", index)
     app.router.add_get("/health", health)
     app.router.add_post("/tbank/notify", tbank_notify)
     app.router.add_static("/static", STATIC)

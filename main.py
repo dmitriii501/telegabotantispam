@@ -25,6 +25,12 @@ async def main() -> None:
     jev = JevClient(os.environ["TYPESAFE_API_KEY"], model=os.getenv("JEV_MODEL", "jev-latest"))
     bot = Bot(os.environ["TELEGRAM_BOT_TOKEN"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     adapter = TelegramAdapter(bot, Moderator(jev), storage)
+    from webapp.legal import missing_details
+
+    if adapter.webapp_url and missing_details():
+        logging.getLogger(__name__).warning(
+            "The offer and privacy pages show empty seller details, fill in %s in .env before the first sale", ", ".join(missing_details())
+        )
     if not adapter.ocr.available:
         logging.getLogger(__name__).warning("Tesseract is not installed: text on pictures will not be read")
     adapter.bot_username = (await bot.get_me()).username

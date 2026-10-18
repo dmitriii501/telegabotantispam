@@ -93,10 +93,17 @@ function renderPay() {
       <div><small>Тариф «${esc(planOf(p).title)}», ${TERM_LABEL[p.months]}</small><span>действует до ${dateText(endsAt(p))}</span></div>
       <b>${money(costOf(p), p.method)}</b></div>
     <div class="tag center">${fine}</div>
-    <div class="tag center">Вопросы и возврат в течение 7 дней: команда /paysupport у бота.</div>`;
+    <div class="tag center">Оплачивая, вы принимаете <button class="linkbtn" data-href="/offer">условия оферты</button>.
+      Вопросы и возврат: команда /paysupport у бота.</div>`;
   const view = $("#view");
   view.onclick = (e) => {
     const d = e.target.dataset;
+    if (d.href) {
+      const url = location.origin + d.href;
+      if (tg.openLink) tg.openLink(url);
+      else window.open(url, "_blank");
+      return;
+    }
     if (d.plan) p.plan = d.plan;
     else if (d.term) p.months = Number(d.term);
     else if (d.method) p.method = d.method;
