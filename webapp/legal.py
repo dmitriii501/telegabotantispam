@@ -7,7 +7,6 @@ Drafted as a sensible starting point for an individual entrepreneur: have a lawy
 
 import html
 import os
-from datetime import date
 
 from core.billing import PERIOD_DAYS, PLANS, REFUND_DAYS, TERMS, TRIAL_CHECKS, TRIAL_DAYS, price, price_rub
 

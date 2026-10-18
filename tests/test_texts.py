@@ -7,8 +7,9 @@ from aiogram.enums import ChatMemberStatus
 from aiogram.filters import CommandObject
 
 from adapters.telegram import bot as botmod
-from tests.test_handlers import CHAT, OWNER, SPAM, answer, env, msg, sent_to  # noqa: F401
-from tests.test_webapp import CHAT as WEB_CHAT, client, h  # noqa: F401
+from tests.test_handlers import CHAT, OWNER, SPAM, answer, msg, sent_to
+from tests.test_webapp import CHAT as WEB_CHAT  # noqa: F401
+from tests.test_webapp import h
 
 INTERNAL = re.compile(r"rule_violation|delete_|send_to_review|forward_useful|_silent|none\b|Jev|jev|токен", re.I)
 

@@ -5,6 +5,7 @@ Docs: https://www.tbank.ru/kassa/dev/payments/ . Everything that can be tested w
 function here; the HTTP call is one small method that tests replace.
 """
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -135,10 +136,13 @@ class TBank:
     async def _post(self, method: str, payload: dict) -> dict:
         try:
             connector = aiohttp.TCPConnector(ssl=ssl_context())
-            async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=20)) as session:
-                async with session.post(f"{API_URL}/{method}", json=payload) as response:
-                    data = await response.json(content_type=None)
-        except (aiohttp.ClientError, TimeoutError, ValueError) as e:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with (
+                aiohttp.ClientSession(connector=connector, timeout=timeout) as session,
+                session.post(f"{API_URL}/{method}", json=payload) as response,
+            ):
+                data = await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
             raise TBankError(f"нет связи с банком: {e}") from e
         if not isinstance(data, dict) or not data.get("Success"):
             log.warning("T-Bank %s refused: %s", method, {k: data.get(k) for k in ("ErrorCode", "Message", "Details")} if isinstance(data, dict) else data)

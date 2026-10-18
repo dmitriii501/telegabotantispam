@@ -1,0 +1,10 @@
+# The versions the tests ran against. Used with: pip install -r requirements.txt -c constraints.txt
+# Update on purpose (pip install -U ..., run the tests, copy the versions here), not by accident on a server restart.
+aiogram==3.31.0
+aiohttp==3.14.3
+aiosqlite==0.22.1
+pillow==12.3.0
+python-dotenv==1.2.3
+pydantic==2.13.5
+multidict==6.9.1
+yarl==1.25.1

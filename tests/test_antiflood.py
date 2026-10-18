@@ -4,10 +4,10 @@ from unittest.mock import AsyncMock
 import pytest
 from aiogram.filters import CommandObject
 
-from adapters.telegram import bot as botmod
 from core.moderation import ChatConfig
-from tests.test_handlers import CHAT, answer, env, msg  # noqa: F401  (env is a fixture)
-from tests.test_webapp import CHAT as WEB_CHAT, client, h  # noqa: F401  (client is a fixture)
+from tests.test_handlers import CHAT, answer, msg
+from tests.test_webapp import CHAT as WEB_CHAT
+from tests.test_webapp import h
 
 
 def command(args=None):

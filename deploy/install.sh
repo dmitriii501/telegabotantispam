@@ -23,7 +23,7 @@ rsync -a --delete --exclude '.git' --exclude '.env' --exclude 'bot.db*' --exclud
 
 python3 -m venv "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install -q --upgrade pip
-"$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+"$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt" -c "$APP_DIR/constraints.txt"
 
 if [ ! -f "$APP_DIR/.env" ]; then
   cp "$APP_DIR/.env.example" "$APP_DIR/.env"

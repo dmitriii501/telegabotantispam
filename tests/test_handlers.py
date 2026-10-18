@@ -300,3 +300,33 @@ async def test_trusted_authors_are_not_checked(env):
     m = msg()
     await adapter.handle_comment(m)
     assert jev.calls == [] and m.delete.await_count == 0
+
+
+async def test_a_flood_control_pause_from_telegram_is_waited_out(env, monkeypatch):
+    from aiogram.exceptions import TelegramRetryAfter
+    from aiogram.methods import DeleteMessage
+
+    waits = []
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr("adapters.telegram.bot.asyncio.sleep", fake_sleep)
+    adapter, _ = env.build(SPAM)
+    m = msg("Реклама моего канала t.me/x")
+    m.delete = AsyncMock(side_effect=[TelegramRetryAfter(DeleteMessage(chat_id=1, message_id=1), "Flood", 3), None])
+    await adapter.handle_comment(m)
+    assert m.delete.await_count == 2 and waits and waits[0] >= 3
+    assert (await last_log(env.storage))["executed"] == 1
+
+
+async def test_a_very_long_flood_control_pause_is_not_waited_for(env, monkeypatch):
+    from aiogram.exceptions import TelegramRetryAfter
+    from aiogram.methods import DeleteMessage
+
+    adapter, _ = env.build(SPAM)
+    m = msg("Реклама моего канала t.me/x")
+    m.delete = AsyncMock(side_effect=TelegramRetryAfter(DeleteMessage(chat_id=1, message_id=1), "Flood", 3600))
+    await adapter.handle_comment(m)
+    assert m.delete.await_count == 1
+    assert (await last_log(env.storage))["executed"] == 0, "recorded as not carried out"

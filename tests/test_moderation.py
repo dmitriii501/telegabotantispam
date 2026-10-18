@@ -1,4 +1,3 @@
-import pytest
 
 from core.models import ActionType, Author, Category, Comment, Verdict
 from core.moderation import (

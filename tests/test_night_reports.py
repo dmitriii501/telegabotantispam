@@ -7,7 +7,7 @@ from aiogram.filters import CommandObject
 
 from core.models import ActionType, Author, Comment
 from core.moderation import ChatConfig, Moderator
-from tests.test_handlers import ADMIN_ID, CHAT, OWNER, answer, env, msg, sent_to  # noqa: F401
+from tests.test_handlers import ADMIN_ID, CHAT, OWNER, answer, msg, sent_to
 
 BORDERLINE = answer("normal", 0.6, probs={"normal": 0.6, "spam": 0.05, "rule_violation": 0.3, "useful": 0.05})
 NIGHT = datetime(2026, 9, 29, 0, 30, tzinfo=timezone.utc)  # 03:30 in Moscow

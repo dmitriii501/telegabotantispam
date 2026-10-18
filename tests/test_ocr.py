@@ -12,7 +12,7 @@ from core.models import ActionType, Category, Verdict
 from core.moderation import MODES, decide
 from core.ocr import OcrEngine, clean
 from core.rules import BASE_RULE, Rule
-from tests.test_handlers import CHAT, OWNER, SPAM_BOT, answer, env, msg, sent_to  # noqa: F401
+from tests.test_handlers import CHAT, OWNER, SPAM_BOT, answer, msg, sent_to
 
 # ------------------------------------------------------------------------------ engine
 

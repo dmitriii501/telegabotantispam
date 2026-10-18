@@ -6,8 +6,9 @@ from aiogram.filters import CommandObject
 from core.links import Link, extract_links, matches, normalize_entry, outside
 from core.models import ActionType, Author, Comment
 from core.moderation import ChatConfig, Moderator, build_state
-from tests.test_handlers import CHAT, answer, env, msg  # noqa: F401
-from tests.test_webapp import CHAT as WEB_CHAT, client, h  # noqa: F401
+from tests.test_handlers import CHAT, answer, msg
+from tests.test_webapp import CHAT as WEB_CHAT  # noqa: F401
+from tests.test_webapp import h
 
 # ------------------------------------------------------------------ finding and matching
 
@@ -195,7 +196,7 @@ async def test_panel_partial_update_keeps_the_rest(client):  # noqa: F811
 
 
 @pytest.mark.parametrize("bad", [{"mode": "evil"}, {"allowed": "example.com"}, {"allowed": ["не адрес"]}, {"blocked": [1]},
-                                 {"allowed": ["a%d.com" % i for i in range(51)]}])
+                                 {"allowed": [f"a{i}.com" for i in range(51)]}])
 async def test_panel_rejects_bad_link_settings(client, bad):  # noqa: F811
     assert (await client.put(f"/api/chat/{WEB_CHAT}/links", json=bad, headers=h())).status == 400
 

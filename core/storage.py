@@ -50,6 +50,29 @@ CREATE TABLE IF NOT EXISTS log (
     -- 1 once an admin replied to the comment
     answered INTEGER NOT NULL DEFAULT 0
 );
+-- The log is the biggest table (every checked comment, 30 days) and is read on every incoming comment:
+-- without these indexes each of those reads scans all of it.
+CREATE INDEX IF NOT EXISTS idx_log_chat_ts ON log (chat_id, ts);
+CREATE INDEX IF NOT EXISTS idx_log_chat_user_ts ON log (chat_id, user_id, ts);
+CREATE INDEX IF NOT EXISTS idx_log_chat_id ON log (chat_id, id);
+CREATE INDEX IF NOT EXISTS idx_log_ts ON log (ts);
+CREATE INDEX IF NOT EXISTS idx_log_pending ON log (chat_id) WHERE action = 'send_to_review' AND feedback IS NULL;
+-- Who was last seen as an admin of which chat: the panel lists a person's chats from here instead of asking
+-- Telegram about every chat the bot is in.
+CREATE TABLE IF NOT EXISTS chat_admins (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_chat_admins_user ON chat_admins (user_id);
+-- AI-read comments per chat and day. Kept apart from the log: it holds no personal data, so it outlives the log's
+-- retention, and the plan limit is counted from it.
+CREATE TABLE IF NOT EXISTS usage (
+    chat_id INTEGER NOT NULL,
+    day INTEGER NOT NULL,  -- unix time of the day's start (UTC)
+    checks INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat_id, day)
+);
 CREATE TABLE IF NOT EXISTS appeals (
     user_id INTEGER NOT NULL,
     log_id INTEGER NOT NULL,
@@ -193,14 +216,27 @@ DELETION_WINDOW_DAYS = 30
 DELETING = ("delete_and_ban", "delete_and_mute", "delete_silent", "delete_and_explain")
 
 
+async def _first(cur: aiosqlite.Cursor, default: int = 0) -> int:
+    """The first column of the first row (a COUNT, a SUM), or `default` when there is no row."""
+    row = await cur.fetchone()
+    return row[0] if row else default
+
+
 class Storage:
     def __init__(self, path: str):
         self.path = path
-        self.db: aiosqlite.Connection | None = None
+        self._db: aiosqlite.Connection | None = None
+
+    @property
+    def db(self) -> aiosqlite.Connection:
+        """The open connection; using the storage before `open()` is a programming error, not a missing value."""
+        if self._db is None:
+            raise RuntimeError("Storage is not open")
+        return self._db
 
     async def open(self) -> None:
-        self.db = await aiosqlite.connect(self.path)
-        self.db.row_factory = aiosqlite.Row
+        self._db = await aiosqlite.connect(self.path)
+        self._db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.execute("PRAGMA busy_timeout=5000")
         await self.db.execute("PRAGMA synchronous=NORMAL")
@@ -210,11 +246,22 @@ class Storage:
         await self._add_missing_columns("trusted", [("name", "TEXT NOT NULL DEFAULT ''")])
         await self._add_missing_columns("posts", [("ts", "INTEGER")])
         await self._add_missing_columns("payments", [("currency", "TEXT NOT NULL DEFAULT 'XTR'"), ("email", "TEXT")])
+        await self._backfill_usage()
         # Chats that existed before the trial was introduced start their trial now.
         await self.db.execute(
             "UPDATE chats SET trial_until = ? WHERE trial_until IS NULL", (int(time.time()) + TRIAL_DAYS * DAY,)
         )
         await self.db.commit()
+
+    async def _backfill_usage(self) -> None:
+        """Databases from before the usage table: seed it from the log once."""
+        async with self.db.execute("SELECT COUNT(*) FROM usage") as cur:
+            if await _first(cur):
+                return
+        await self.db.execute(
+            "INSERT INTO usage (chat_id, day, checks) SELECT chat_id, ts / 86400 * 86400, COUNT(*) FROM log WHERE tokens > 0 "
+            "GROUP BY chat_id, ts / 86400 * 86400"
+        )
 
     async def _add_missing_columns(self, table: str, columns: list[tuple[str, str]]) -> None:
         async with self.db.execute(f"PRAGMA table_info({table})") as cur:
@@ -224,8 +271,9 @@ class Storage:
                 await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     async def close(self) -> None:
-        if self.db:
-            await self.db.close()
+        if self._db:
+            await self._db.close()
+            self._db = None
 
     # --- chats ---
 
@@ -274,9 +322,24 @@ class Storage:
         await self.db.execute(f"UPDATE chats SET {key} = ? WHERE chat_id = ?", (value, chat_id))
         await self.db.commit()
 
+    async def remember_admins(self, chat_id: int, user_ids: set[int]) -> None:
+        """Replace the known admins of a chat with the list Telegram just gave."""
+        await self.db.execute("DELETE FROM chat_admins WHERE chat_id = ?", (chat_id,))
+        await self.db.executemany("INSERT INTO chat_admins (chat_id, user_id) VALUES (?, ?)", [(chat_id, u) for u in user_ids])
+        await self.db.commit()
+
+    async def chats_of_admin(self, user_id: int) -> list[aiosqlite.Row]:
+        """Chats where this person is the owner or was seen as an admin: the candidates for their panel."""
+        async with self.db.execute(
+            "SELECT * FROM chats WHERE owner_id = ? OR chat_id IN (SELECT chat_id FROM chat_admins WHERE user_id = ?) "
+            "ORDER BY chat_id",
+            (user_id, user_id),
+        ) as cur:
+            return list(await cur.fetchall())
+
     async def all_chats(self) -> list[aiosqlite.Row]:
         async with self.db.execute("SELECT * FROM chats") as cur:
-            return await cur.fetchall()
+            return list(await cur.fetchall())
 
     async def save_rules(self, chat_id: int, raw_text: str, rules_json: str, owner_id: int) -> None:
         """Save rules straight from the web panel; the first admin to save becomes the owner."""
@@ -356,7 +419,7 @@ class Storage:
                  OR (action = 'send_to_review' AND feedback = 'confirmed'))""",
             (chat_id, user_id, int(time.time()) - days * DAY, *DELETING),
         ) as cur:
-            (n,) = await cur.fetchone()
+            n = await _first(cur)
         return n
 
     # --- trusted users ---
@@ -372,7 +435,7 @@ class Storage:
 
     async def list_trusted(self, chat_id: int) -> list[aiosqlite.Row]:
         async with self.db.execute("SELECT user_id, name FROM trusted WHERE chat_id = ?", (chat_id,)) as cur:
-            return await cur.fetchall()
+            return list(await cur.fetchall())
 
     async def is_trusted(self, chat_id: int, user_id: int) -> bool:
         async with self.db.execute(
@@ -475,7 +538,7 @@ class Storage:
         marks = ", ".join("?" for _ in fields)
         cur = await self.db.execute(f"INSERT INTO log ({cols}) VALUES ({marks})", tuple(fields.values()))
         await self.db.commit()
-        return cur.lastrowid
+        return cur.lastrowid or 0
 
     async def set_executed(self, log_id: int, executed: bool) -> None:
         await self.db.execute("UPDATE log SET executed = ? WHERE id = ?", (int(executed), log_id))
@@ -498,7 +561,7 @@ class Storage:
         await self.db.commit()
         entry = await self.get_log(log_id)
         key = example_key(entry["text"]) if entry else None
-        if key and feedback in ("not_spam", "confirmed"):
+        if entry and key and feedback in ("not_spam", "confirmed"):
             await self.add_example(entry["chat_id"], key, "allow" if feedback == "not_spam" else "remove")
 
     async def add_example(self, chat_id: int, key: str, kind: str) -> None:
@@ -531,14 +594,14 @@ class Storage:
             f"SELECT * FROM log WHERE chat_id = ? AND action IN ({marks}) ORDER BY id DESC LIMIT ?",
             (chat_id, *actions, limit),
         ) as cur:
-            return await cur.fetchall()
+            return list(await cur.fetchall())
 
     async def pending_review_count(self, chat_id: int) -> int:
         async with self.db.execute(
             "SELECT COUNT(*) FROM log WHERE chat_id = ? AND action = 'send_to_review' AND feedback IS NULL",
             (chat_id,),
         ) as cur:
-            (n,) = await cur.fetchone()
+            n = await _first(cur)
         return n
 
     async def top_reasons(self, chat_id: int, since: int, limit: int = 3) -> list[tuple[str, int]]:
@@ -557,7 +620,7 @@ class Storage:
                ORDER BY confidence DESC, id DESC LIMIT ?""",
             (chat_id, since, limit),
         ) as cur:
-            return await cur.fetchall()
+            return list(await cur.fetchall())
 
     # --- analytics ---
 
@@ -577,6 +640,8 @@ class Storage:
             (chat_id, since),
         ) as cur:
             row = await cur.fetchone()
+        if row is None:  # an aggregate always answers; this only calms the type checker
+            return {"n": 0, "avg": None, "negative": 0, "positive": 0}
         return {"n": row["n"] or 0, "avg": row["avg"], "negative": row["neg"] or 0, "positive": row["pos"] or 0}
 
     async def unanswered(self, chat_id: int, since: int, min_score: float = 0.6, limit: int = 20) -> list[aiosqlite.Row]:
@@ -587,20 +652,30 @@ class Storage:
                ORDER BY lead DESC, needs_answer DESC, id DESC LIMIT ?""",
             (chat_id, since, min_score, min_score, limit),
         ) as cur:
-            return await cur.fetchall()
+            return list(await cur.fetchall())
 
     # --- billing ---
 
     async def chats_of_owner(self, user_id: int) -> list[aiosqlite.Row]:
         async with self.db.execute("SELECT * FROM chats WHERE owner_id = ? ORDER BY chat_id", (user_id,)) as cur:
-            return await cur.fetchall()
+            return list(await cur.fetchall())
+
+    async def add_usage(self, chat_id: int, count: int = 1) -> None:
+        """One more comment of this chat was read by the AI."""
+        day = int(time.time()) // DAY * DAY
+        await self.db.execute(
+            "INSERT INTO usage (chat_id, day, checks) VALUES (?, ?, ?) "
+            "ON CONFLICT (chat_id, day) DO UPDATE SET checks = checks + excluded.checks",
+            (chat_id, day, count),
+        )
+        await self.db.commit()
 
     async def ai_checks(self, chat_id: int, since: int) -> int:
-        """Comments of this chat that the AI really read since `since` (rows with token usage)."""
+        """Comments of this chat that the AI really read since `since` (counted by day, so the first day is whole)."""
         async with self.db.execute(
-            "SELECT COUNT(*) FROM log WHERE chat_id = ? AND ts >= ? AND tokens > 0", (chat_id, since)
+            "SELECT COALESCE(SUM(checks), 0) FROM usage WHERE chat_id = ? AND day >= ?", (chat_id, since // DAY * DAY)
         ) as cur:
-            return (await cur.fetchone())[0]
+            return await _first(cur)
 
     async def record_payment(
         self, charge_id: str, chat_id: int, payer_id: int, plan: str, months: int, stars: int,
@@ -628,6 +703,8 @@ class Storage:
         """The operator gives (or takes back, with negative days) access by hand. Returns the new end date."""
         await self.ensure_chat(chat_id)
         chat = await self.get_chat(chat_id)
+        if chat is None:
+            raise RuntimeError("ensure_chat did not create the chat")
         now = int(time.time())
         same = (chat["plan"] or "start") == plan
         base = chat["paid_until"] if chat["paid_until"] and chat["paid_until"] > now and same else now
@@ -715,7 +792,7 @@ class Storage:
         async with self.db.execute(
             "SELECT COUNT(*) FROM reports WHERE chat_id = ? AND message_id = ?", (chat_id, message_id)
         ) as cur:
-            return (await cur.fetchone())[0]
+            return await _first(cur)
 
     async def purge_old(self, days: int) -> int:
         """Drop comment texts and log rows older than `days` (personal data must not live forever)."""
@@ -723,6 +800,7 @@ class Storage:
         cur = await self.db.execute("DELETE FROM log WHERE ts < ?", (cutoff,))
         await self.db.execute("DELETE FROM appeals WHERE ts < ?", (cutoff,))
         await self.db.execute("DELETE FROM reports WHERE ts < ?", (cutoff,))
+        await self.db.execute("DELETE FROM usage WHERE day < ?", (int(time.time()) - 62 * DAY,))
         await self.db.execute("DELETE FROM orders WHERE ts < ? AND status = 'new'", (cutoff,))
         await self.db.execute("DELETE FROM profiles WHERE fetched_at < ?", (cutoff,))
         await self.db.execute("DELETE FROM ocr_cache WHERE ts < ?", (cutoff,))
@@ -733,7 +811,7 @@ class Storage:
         async with self.db.execute(
             "SELECT * FROM chats WHERE digest = 1 AND owner_id IS NOT NULL AND enabled = 1"
         ) as cur:
-            return await cur.fetchall()
+            return list(await cur.fetchall())
 
     async def mark_digest_sent(self, chat_id: int, day: str) -> None:
         await self.db.execute("UPDATE chats SET digest_last = ? WHERE chat_id = ?", (day, chat_id))
@@ -745,7 +823,7 @@ class Storage:
         async with self.db.execute(
             "SELECT COUNT(*) FROM appeals WHERE user_id = ? AND ts >= ?", (user_id, int(time.time()) - DAY)
         ) as cur:
-            (n,) = await cur.fetchone()
+            n = await _first(cur)
         return n == 0
 
     async def add_appeal(self, user_id: int, log_id: int) -> None:

@@ -1,6 +1,6 @@
 """The public pages: landing, offer, privacy."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer

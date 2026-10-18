@@ -1,9 +1,8 @@
 """Stickers, photos and other messages without text count for the antiflood; service messages do not."""
 
-from unittest.mock import MagicMock
 
 from adapters.telegram import bot as botmod
-from tests.test_handlers import CHAT, OWNER, answer, env, msg, sent_to  # noqa: F401
+from tests.test_handlers import CHAT, OWNER, answer, msg, sent_to
 
 
 def media(kind="sticker", i=0, user_id=5):

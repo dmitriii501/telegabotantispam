@@ -68,4 +68,4 @@ def example_key(text: str) -> str | None:
     """
     words = re.findall(r"\w+", normalize(text).lower())
     key = " ".join(words)
-    return hashlib.sha1(key.encode()).hexdigest() if len(key) >= MIN_KEY_LENGTH else None
+    return hashlib.sha1(key.encode(), usedforsecurity=False).hexdigest() if len(key) >= MIN_KEY_LENGTH else None

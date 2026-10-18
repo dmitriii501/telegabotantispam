@@ -11,6 +11,7 @@ import re
 import secrets
 import time
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from aiogram import F
 from aiogram.enums import ChatType
@@ -74,8 +75,26 @@ def link_button(text: str, url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, url=url)]])
 
 
+if TYPE_CHECKING:
+    from aiogram import Bot
+
+    from core.storage import Storage
+
+
 class PaymentsMixin:
-    """Mixed into TelegramAdapter; relies on its bot, storage, dm, is_admin, is_admin_message, chat_title, _notified."""
+    """Mixed into TelegramAdapter; relies on what the adapter provides, declared here for the type checker."""
+
+    if TYPE_CHECKING:
+        bot: Bot
+        storage: Storage
+
+        async def dm(self, user_id: int | None, text: str, markup: InlineKeyboardMarkup | None = None) -> bool: ...
+        async def is_admin(self, chat_id: int, user_id: int, fresh: bool = False) -> bool: ...
+        async def is_admin_message(self, message: Message) -> bool: ...
+        async def chat_title(self, chat_id: int) -> str: ...
+        async def notify_owner(
+            self, chat, key: str, text: str, cooldown: float, markup: InlineKeyboardMarkup | None = None
+        ) -> None: ...
 
     def _init_payments(self) -> None:
         self.bot_username: str | None = None  # set at startup; deep links to the payment screen need it
@@ -269,8 +288,8 @@ class PaymentsMixin:
     @staticmethod
     def parse_payload(payload: str) -> tuple[int, str, int] | None:
         try:
-            chat_id, plan, months = payload.split(":")
-            chat_id, months = int(chat_id), int(months)
+            raw_chat, plan, raw_months = payload.split(":")
+            chat_id, months = int(raw_chat), int(raw_months)
         except (ValueError, AttributeError):
             return None
         return (chat_id, plan, months) if plan in PLANS and months in TERMS else None
@@ -279,13 +298,13 @@ class PaymentsMixin:
         """What Telegram needs for a Stars invoice: the same for the invoice in chat and the link of the panel."""
         plan = PLANS[plan_key]
         title = await self.chat_title(chat_id)
-        return dict(
-            title=f"DefenceAi «{plan.title}», {months} мес."[:32],
-            description=f"Модерация чата «{title}»: {months * PERIOD_DAYS} дней, до {number(plan.checks)} ИИ-проверок в месяц."[:255],
-            payload=f"{chat_id}:{plan_key}:{months}",
-            currency="XTR",
-            prices=[LabeledPrice(label=f"{plan.title}, {months} мес.", amount=price(plan, months))],
-        )
+        return {
+            "title": f"DefenceAi «{plan.title}», {months} мес."[:32],
+            "description": f"Модерация чата «{title}»: {months * PERIOD_DAYS} дней, до {number(plan.checks)} ИИ-проверок в месяц."[:255],
+            "payload": f"{chat_id}:{plan_key}:{months}",
+            "currency": "XTR",
+            "prices": [LabeledPrice(label=f"{plan.title}, {months} мес.", amount=price(plan, months))],
+        }
 
     async def create_stars_link(self, chat_id: int, plan_key: str, months: int) -> str:
         """A link for the panel's `openInvoice`: the payment window opens inside the Mini App."""
@@ -425,6 +444,8 @@ class PaymentsMixin:
         order_id = secrets.token_hex(8)
         await self.storage.create_order(order_id, chat_id, user_id, plan_key, months, amount, email)
         site = os.getenv("WEBAPP_URL", "").rstrip("/")
+        if self.tbank is None:
+            raise TBankError("терминал Т-Банка не подключён")
         try:
             payment_id, url = await self.tbank.create_payment(
                 order_id,

@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from core.rules import Rule, rules_to_json
-from tests.test_webapp import CHAT as DEST, client, h  # noqa: F401
+from tests.test_webapp import CHAT as DEST  # noqa: F401
+from tests.test_webapp import h
 
 SOURCE = -2002
 

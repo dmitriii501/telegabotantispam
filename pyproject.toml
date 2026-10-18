@@ -1,0 +1,24 @@
+# Tool settings only: the project is run from the folder, not installed as a package.
+
+[tool.ruff]
+target-version = "py310"  # the server may run an older Python than the development machine
+line-length = 130
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "C4", "PIE", "RET", "I"]
+ignore = [
+    "E501",    # long lines: the texts of the bot are in Russian and read better unbroken
+    "RET504",  # a named result before `return` often reads better
+    "SIM108",  # no ternaries when the if-form is clearer
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+# The adapter's handlers read aiogram's Optional fields (message.from_user, callback.message) without narrowing:
+# about 90 findings, none of them seen in practice (group messages always have a sender). Tracked as debt in docs/audit.md.
+files = ["core", "webapp"]

@@ -7,7 +7,7 @@ from aiogram.exceptions import TelegramForbiddenError
 
 from adapters.telegram import bot as botmod
 from core.normalizer import example_key
-from tests.test_handlers import ADMIN_ID, CHAT, OWNER, SPAM_BOT, answer, env, msg, sent_to  # noqa: F401
+from tests.test_handlers import ADMIN_ID, CHAT, OWNER, SPAM_BOT, answer, msg, sent_to
 
 
 async def trial_env(env, *responses):

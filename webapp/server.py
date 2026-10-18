@@ -12,18 +12,17 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from aiohttp import web
-
 from aiogram.exceptions import TelegramAPIError
+from aiohttp import web
 
 from core.billing import DAY, PERIOD_DAYS, PLANS, TERMS, access, price, price_rub
 from core.jev_client import JevError
-from core.tbank import EMAIL, TBankError
-from core.models import DELETING_ACTIONS, ActionType
 from core.links import MAX_ENTRIES, normalize_entry
-from webapp import legal
+from core.models import DELETING_ACTIONS, ActionType
 from core.moderation import MODES, ChatConfig
 from core.rules import ACTIONS, CONTEXT, EVERYTHING, PERMISSION, PROHIBITION, Rule, rules_to_json
+from core.tbank import EMAIL, TBankError
+from webapp import legal
 from webapp.auth import validate_init_data
 
 log = logging.getLogger(__name__)
@@ -90,7 +89,7 @@ async def read_json(request: web.Request) -> dict:
     try:
         data = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
-        raise ApiError(400, "Некорректный запрос")
+        raise ApiError(400, "Некорректный запрос") from None
     if not isinstance(data, dict):
         raise ApiError(400, "Некорректный запрос")
     return data
@@ -101,7 +100,7 @@ async def admin_chat(request: web.Request, fresh: bool = False):
     try:
         chat_id = int(request.match_info["chat_id"])
     except ValueError:
-        raise ApiError(400, "Некорректный чат")
+        raise ApiError(400, "Некорректный чат") from None
     app = request.app
     if not await app["adapter"].is_admin(chat_id, request["user"]["id"], fresh=fresh):
         raise ApiError(403, "Нет доступа к этому чату")
@@ -209,7 +208,8 @@ async def list_chats(request: web.Request) -> web.Response:
     adapter = request.app["adapter"]
     user_id = request["user"]["id"]
     chats = []
-    for row in await adapter.storage.all_chats():
+    # Only this person's candidates are checked with Telegram, not every chat the bot is in.
+    for row in await adapter.storage.chats_of_admin(user_id):
         if await adapter.is_admin(row["chat_id"], user_id):
             chats.append(
                 {
@@ -281,7 +281,7 @@ async def start_payment(request: web.Request) -> web.Response:
         try:
             url = await adapter.create_stars_link(chat["chat_id"], plan, months)
         except TelegramAPIError:
-            raise ApiError(502, "Telegram не создал счёт. Попробуйте ещё раз.")
+            raise ApiError(502, "Telegram не создал счёт. Попробуйте ещё раз.") from None
         return web.json_response({"kind": "invoice", "url": url})
     if not getattr(adapter, "tbank", None):
         raise ApiError(400, "Оплата картой пока не подключена. Выберите звёзды.")
@@ -292,7 +292,7 @@ async def start_payment(request: web.Request) -> web.Response:
     try:
         url = await adapter.make_rub_payment(request["user"]["id"], chat["chat_id"], plan, months, email)
     except TBankError as e:
-        raise ApiError(502, f"Банк не создал счёт: {e}")
+        raise ApiError(502, f"Банк не создал счёт: {e}") from None
     return web.json_response({"kind": "link", "url": url})
 
 
@@ -323,9 +323,7 @@ async def put_settings(request: web.Request) -> web.Response:
     data = await read_json(request)
     updates = {}
     for key, value in data.items():
-        if key == "mode" and value in MODES:
-            updates[key] = value
-        elif key == "useful_mode" and value in USEFUL_MODES:
+        if key == "mode" and value in MODES or key == "useful_mode" and value in USEFUL_MODES:
             updates[key] = value
         elif key in BOOL_SETTINGS and isinstance(value, bool):
             updates[key] = int(value)
@@ -394,7 +392,7 @@ async def parse_text(request: web.Request) -> web.Response:
     try:
         rules = await request.app["adapter"].moderator.parse_rules(text)
     except JevError:
-        raise ApiError(503, "ИИ временно недоступен, попробуйте позже")
+        raise ApiError(503, "ИИ временно недоступен, попробуйте позже") from None
     return web.json_response({"rules": [asdict(r) for r in rules]})
 
 
@@ -431,7 +429,7 @@ async def get_insights(request: web.Request) -> web.Response:
     try:
         days = min(max(int(request.query.get("days", "7")), 1), 30)
     except ValueError:
-        raise ApiError(400, "Некорректный период")
+        raise ApiError(400, "Некорректный период") from None
     storage = request.app["adapter"].storage
     chat_id = chat["chat_id"]
     since = int(time.time()) - days * 24 * 3600
@@ -497,7 +495,7 @@ async def untrust(request: web.Request) -> web.Response:
     try:
         user_id = int(request.match_info["user_id"])
     except ValueError:
-        raise ApiError(400, "Некорректный пользователь")
+        raise ApiError(400, "Некорректный пользователь") from None
     await request.app["adapter"].storage.set_trusted(chat["chat_id"], user_id, False)
     return web.json_response({"ok": True})
 

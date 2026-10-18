@@ -9,7 +9,7 @@ from aiogram.filters import CommandObject
 
 from core.billing import DAY, PLANS, price_rub
 from core.tbank import EMAIL, TBank, TBankError, kopecks, sign
-from tests.test_handlers import CHAT, OWNER, env, msg, sent_to  # noqa: F401
+from tests.test_handlers import CHAT, msg, sent_to
 
 ADMIN = 1
 PW = "secret-pw"

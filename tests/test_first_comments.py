@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from core.models import ActionType, Author, Comment
 from core.moderation import FIRST_COMMENT_WINDOW, ChatConfig, Moderator
-from tests.test_handlers import CHAT, OWNER, answer, env, msg, sent_to  # noqa: F401
+from tests.test_handlers import CHAT, OWNER, answer, msg, sent_to
 
 # violation 35%: "normal" mode ignores it, "strict" asks the admin
 BORDERLINE = answer("normal", 0.6, probs={"normal": 0.6, "spam": 0.05, "rule_violation": 0.3, "useful": 0.05})

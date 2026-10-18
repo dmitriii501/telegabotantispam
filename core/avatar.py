@@ -16,7 +16,7 @@ def dhash(image_bytes: bytes) -> str | None:
         from PIL import Image
 
         with Image.open(io.BytesIO(image_bytes)) as img:
-            small = img.convert("L").resize((9, 8), Image.LANCZOS)
+            small = img.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
             pixels = list(small.tobytes())  # 72 grey values (mode L)
     except Exception:  # damaged file, unsupported format, Pillow missing: no fingerprint, no harm
         return None

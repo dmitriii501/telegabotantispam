@@ -9,11 +9,12 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
-from core.jev_client import JevClient
-from core.models import ActionType, Category, Comment, Decision, Verdict
 from core.fallback import looks_like_spam
+from core.jev_client import JevClient
 from core.links import any_match, extract_links, outside
+from core.models import ActionType, Category, Comment, Decision, Verdict
 from core.normalizer import normalize
 from core.rules import (
     BASE_RULE,
@@ -65,7 +66,7 @@ MUTE_HOURS = 24
 CONTEXT_LIMIT = 600
 
 
-@dataclass
+@dataclass(frozen=True)  # shared as a default argument, so it must not be changeable
 class Thresholds:
     review_below: float = 0.75  # violation with lower confidence goes to the admin
     ban_confidence: float = 0.9  # spam this sure + bot-like author -> ban
@@ -232,7 +233,7 @@ def build_state(comment: Comment, rules: list[Rule], allowed_domains: list[str] 
     # Everything the admin wrote goes in: permissions and context help Jev too.
     texts = [BASE_RULE.text, *(r.text for r in rules if r.kind != EVERYTHING)]
     if a.profile:
-        profile = {}
+        profile: dict[str, Any] = {}
         if a.profile.bio is not None:
             profile["bio"] = _clip(a.profile.bio) or "пусто"
         if a.profile.has_photo is not None:
@@ -245,7 +246,7 @@ def build_state(comment: Comment, rules: list[Rule], allowed_domains: list[str] 
     if comment.image_text:
         note = f"[Картинка или стикер. Текст на ней распознан неточно, с ошибками]: {comment.image_text}"
         shown = f"{comment.text}\n{note}" if comment.text else note
-    state = {"rules": texts, "comment": shown, "author": author}
+    state: dict[str, Any] = {"rules": texts, "comment": shown, "author": author}
     if normalized != comment.text:
         state["comment_with_letters_restored"] = normalized
     if comment.links:
@@ -304,7 +305,7 @@ ANALYTICS_QUESTIONS = {
 def build_questions(prohibitions: list[Rule], analytics: bool = False, profile: bool = False) -> dict:
     rule_options = {f"r{i}": rule.text for i, rule in enumerate(prohibitions)}
     rule_options["none"] = "Комментарий не нарушает ни одно правило"
-    questions = {
+    questions: dict[str, Any] = {
         "category": {
             "type": "choice",
             "instructions": "К какой категории относится `comment` с учётом `rules`?",
@@ -387,7 +388,7 @@ def avatar_decision(t: Thresholds) -> Decision:
 def decide(
     verdict: Verdict,
     prohibitions: list[Rule],
-    t: Thresholds = Thresholds(),
+    t: Thresholds = Thresholds(),  # noqa: B008 (frozen)
     escalation: bool = True,
     previous_deletions: int = 0,
     newcomer: bool = False,
@@ -516,7 +517,7 @@ class Moderator:
             return None
         newcomer = comment.author.previous_messages < NEWCOMER_MESSAGES
         if config.blocked_domains and any_match(links, config.blocked_domains):
-            rules, reason, action = [Rule("", PROHIBITION, "delete")], "ссылка из чёрного списка этого чата", "delete"
+            rules, reason, _action = [Rule("", PROHIBITION, "delete")], "ссылка из чёрного списка этого чата", "delete"
         elif outside(links, config.allowed_domains) and (
             config.links_mode == "block" or ((config.links_mode == "newcomers" or night) and newcomer)
         ):
@@ -527,7 +528,7 @@ class Moderator:
                 if night and config.links_mode != "newcomers"
                 else "новичкам пока нельзя публиковать ссылки"
             )
-            rules, action = [Rule("", PROHIBITION, "warn")], "warn"
+            rules, _action = [Rule("", PROHIBITION, "warn")], "warn"
         else:
             return None
         verdict = Verdict(Category.RULE_VIOLATION, 1.0, 0.0, rule_index=0)
@@ -549,7 +550,8 @@ class Moderator:
     def _blanket(config: ChatConfig) -> Decision:
         if config.lockdown:
             return _blanket_decision(None, "сейчас удаляются все сообщения участников")
-        return _blanket_decision(config.blanket, f"правило «{config.blanket.text.rstrip('.!; ')}»")
+        rule = config.blanket
+        return _blanket_decision(rule, f"правило «{rule.text.rstrip('.!; ')}»" if rule else "удаление всех сообщений")
 
     @staticmethod
     def flood_decision(minutes: int = FLOOD_MUTE_MINUTES) -> Decision:

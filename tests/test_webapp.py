@@ -76,6 +76,7 @@ async def test_static_page_and_security_headers(client):
 
 
 async def test_lists_only_chats_where_user_is_admin(client):
+    await client.storage.remember_admins(CHAT, {42})
     data = await (await client.get("/api/chats", headers=h())).json()
     assert data["chats"] == [{"chat_id": CHAT, "title": "Мой канал", "enabled": True, "observe": False}]
     other = await (await client.get("/api/chats", headers=h({"id": 7, "first_name": "X"}))).json()
@@ -328,3 +329,25 @@ async def test_every_script_of_the_panel_is_served(client):
     for name in scripts:
         r = await client.get(f"/static/{name}")
         assert r.status == 200 and "javascript" in r.headers["Content-Type"], name
+
+
+async def test_the_chat_list_asks_telegram_only_about_the_users_own_chats(client):
+    for chat_id in range(-2000, -1900):  # a hundred chats of other people
+        await client.storage.ensure_chat(chat_id)
+        await client.storage.remember_admins(chat_id, {900 + (-chat_id % 7)})
+    await client.storage.remember_admins(CHAT, {42})
+    client.adapter.is_admin.reset_mock()
+    data = await (await client.get("/api/chats", headers=h())).json()
+    assert [c["chat_id"] for c in data["chats"]] == [CHAT]
+    assert client.adapter.is_admin.await_count == 1
+
+
+async def test_owners_and_remembered_admins_are_candidates(client):
+    await client.storage.ensure_chat(-3001)
+    await client.storage.save_rules(-3001, "", "[]", 42)  # becomes the owner
+    ids = {c["chat_id"] for c in await client.storage.chats_of_admin(42)}
+    assert ids == {-3001}
+    await client.storage.remember_admins(CHAT, {42, 43})
+    await client.storage.remember_admins(CHAT, {43})  # replaced, 42 is no longer an admin
+    assert {c["chat_id"] for c in await client.storage.chats_of_admin(42)} == {-3001}
+    assert {c["chat_id"] for c in await client.storage.chats_of_admin(43)} == {CHAT}

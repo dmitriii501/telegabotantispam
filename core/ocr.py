@@ -10,6 +10,7 @@ import io
 import logging
 import re
 import shutil
+from typing import cast
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ class OcrEngine:
                 rgba = img.convert("RGBA")
                 alpha = rgba.split()[3]
                 # Transparent stickers go on mid-grey: both white and black lettering stay readable.
-                background = (128, 128, 128) if alpha.getextrema()[0] < 250 else (255, 255, 255)
+                background = (128, 128, 128) if cast("tuple[int, int]", alpha.getextrema())[0] < 250 else (255, 255, 255)
                 flat = Image.new("RGB", rgba.size, background)
                 flat.paste(rgba, mask=alpha)
             longest = max(flat.size)
@@ -49,7 +50,7 @@ class OcrEngine:
             else:
                 scale = 1.0
             if scale != 1.0:
-                flat = flat.resize((max(1, int(flat.width * scale)), max(1, int(flat.height * scale))), Image.LANCZOS)
+                flat = flat.resize((max(1, int(flat.width * scale)), max(1, int(flat.height * scale))), Image.Resampling.LANCZOS)
             out = io.BytesIO()
             flat.convert("L").save(out, "PNG")
             return out.getvalue()
@@ -58,7 +59,7 @@ class OcrEngine:
 
     async def read(self, image_bytes: bytes) -> str:
         """The text found on the picture, cleaned up; an empty string when there is none or reading failed."""
-        if not self.available:
+        if not self.available or not self.path:
             return ""
         prepared = await asyncio.get_running_loop().run_in_executor(None, self._prepare, image_bytes)
         if prepared is None:

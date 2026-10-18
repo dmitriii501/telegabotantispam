@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 from aiogram.exceptions import TelegramBadRequest
 
 from adapters.telegram import bot as botmod
-from tests.test_handlers import CHAT, SPAM_BOT, answer, env, msg, sent_to  # noqa: F401
+from tests.test_handlers import CHAT, SPAM_BOT, answer, msg, sent_to
 
 USEFUL = answer("useful", 0.95)
 

@@ -19,7 +19,7 @@ from core.moderation import (
     needs_check,
     parse_verdict,
 )
-from core.rules import BASE_RULE, Rule
+from core.rules import BASE_RULE
 from core.storage import Storage
 
 # ------------------------------------------------------------------- local fallback filter

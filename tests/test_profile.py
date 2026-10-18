@@ -16,7 +16,7 @@ from core.models import ActionType, Author, Category, Comment, Profile, Verdict
 from core.moderation import MODES, ChatConfig, Moderator, build_questions, build_state, decide
 from core.rules import BASE_RULE
 from core.storage import Storage
-from tests.test_handlers import ADMIN_ID, CHAT, LINKED, OWNER, SPAM_BOT, answer, env, msg, sent_to  # noqa: F401
+from tests.test_handlers import CHAT, LINKED, OWNER, SPAM_BOT, answer, msg
 
 # ---------------------------------------------------------------------------- pictures
 

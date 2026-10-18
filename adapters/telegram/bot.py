@@ -5,17 +5,22 @@ and in ordinary groups. It needs admin rights to delete messages and ban users.
 """
 
 import asyncio
+import contextlib
 import html
 import logging
 import os
 import random
 import time
 from collections import deque
+from collections.abc import Mapping
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BotCommand,
@@ -31,11 +36,11 @@ from aiogram.types import (
     WebAppInfo,
 )
 
+from adapters.telegram.payments import PaymentsMixin
 from core.avatar import dhash
 from core.jev_client import JevError
 from core.links import MAX_ENTRIES, normalize_entry
-from core.models import DELETING_ACTIONS, ActionType, Author, Comment, Decision, Profile
-from core.ocr import OcrEngine
+from core.models import DELETING_ACTIONS, ActionType, Author, Comment, Decision, Profile, Verdict
 from core.moderation import (
     MODES,
     NEWCOMER_MESSAGES,
@@ -45,10 +50,9 @@ from core.moderation import (
     Moderator,
 )
 from core.normalizer import example_key
+from core.ocr import OcrEngine
 from core.rules import CONTEXT, EVERYTHING, PERMISSION, Rule, rules_to_json
 from core.storage import DAY, Storage
-
-from adapters.telegram.payments import PaymentsMixin
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +102,8 @@ FLOOD_MUTE_MINUTES = 30
 FLOOD_LIMITS = {"messages": (3, 30), "window": (5, 120), "mute": (1, 10080)}
 JEV_ALERT_COOLDOWN = 60 * 60  # tell the owner about a Jev outage at most once an hour
 RIGHTS_ALERT_COOLDOWN = 6 * 60 * 60
+SECURE_RANDOM = random.SystemRandom()
+MAX_RETRY_WAIT = 30  # seconds: a raid makes Telegram say "slow down"; waiting this long for a removal is worth it
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))  # comment texts are deleted after this long
 KIND_LABEL = {
     "question": "вопросы",
@@ -324,6 +330,32 @@ def on_off(value: bool) -> str:
     return "включено" if value else "выключено"
 
 
+@dataclass
+class Incoming:
+    """A member's message and who wrote it (a person or a channel)."""
+
+    message: Message
+    edited: bool
+    text: str
+    chat: Mapping[str, Any] | None  # the chat's row in the database; None for a chat the bot has not stored yet
+    author_id: int
+    author_name: str
+    username: str | None
+    premium: bool
+    is_channel: bool
+
+
+@dataclass
+class Prepared:
+    """What was gathered about the comment before deciding."""
+
+    comment: Comment
+    key: str | None  # the normalized text, the key of the bot's memory of decisions
+    known: str | None  # what was decided about this exact text before
+    previous: int  # messages of the author in this chat so far
+    image_text: str | None
+
+
 class TelegramAdapter(PaymentsMixin):
     def __init__(self, bot: Bot, moderator: Moderator, storage: Storage, ocr: OcrEngine | None = None):
         self.ocr = ocr if ocr is not None else OcrEngine()
@@ -366,6 +398,7 @@ class TelegramAdapter(PaymentsMixin):
                 return False
             cached = (time.time(), {m.user.id for m in members})
             self._admins[chat_id] = cached
+            await self.storage.remember_admins(chat_id, cached[1])
         return user_id in cached[1]
 
     async def is_admin_message(self, message: Message) -> bool:
@@ -519,10 +552,8 @@ class TelegramAdapter(PaymentsMixin):
 
     async def delete_later(self, chat_id: int, message_id: int, delay: int) -> None:
         await asyncio.sleep(delay)
-        try:
+        with contextlib.suppress(TelegramAPIError):
             await self.bot.delete_message(chat_id, message_id)
-        except TelegramAPIError:
-            pass
 
     async def check_rights(self, chat_id: int) -> list[str]:
         me = await self.bot.get_chat_member(chat_id, self.bot.id)
@@ -698,10 +729,8 @@ class TelegramAdapter(PaymentsMixin):
                 "Готов к работе. Задайте правила обычным языком: "
                 "<code>/rules мат можно, рекламу нельзя — бан</code>"
             )
-        try:
+        with contextlib.suppress(TelegramAPIError):
             await self.bot.send_message(event.chat.id, text)
-        except TelegramAPIError:
-            pass
 
     # ------------------------------------------------------------------- rules
 
@@ -831,8 +860,8 @@ class TelegramAdapter(PaymentsMixin):
         chat_id = message.chat.id
         if previous_messages > 0 or (chat_id, user_id) in self._captcha or await self.storage.is_verified(chat_id, user_id):
             return
-        options = random.sample(range(len(CAPTCHA_PICTURES)), 4)
-        answer = random.choice(options)
+        options = SECURE_RANDOM.sample(range(len(CAPTCHA_PICTURES)), 4)  # not guessable from earlier checks
+        answer = SECURE_RANDOM.choice(options)
         user = message.from_user
         mention = f'<a href="tg://user?id={user_id}">{html.escape(user.first_name)}</a>'
         markup = kb([(CAPTCHA_PICTURES[i][0], f"cap:{chat_id}:{user_id}:{i}") for i in options])
@@ -866,10 +895,8 @@ class TelegramAdapter(PaymentsMixin):
         if not pending:
             return
         for message_id in (pending["notice_id"], pending["message_id"]):
-            try:
+            with contextlib.suppress(TelegramAPIError):
                 await self.bot.delete_message(chat_id, message_id)
-            except TelegramAPIError:
-                pass
         try:
             await self.bot.restrict_chat_member(
                 chat_id, user_id, permissions=ChatPermissions(can_send_messages=False),
@@ -892,10 +919,8 @@ class TelegramAdapter(PaymentsMixin):
         pending = self._captcha.get((chat_id, user_id))
         if pending is None:
             await call.answer("Проверка устарела. Просто напишите сообщение ещё раз.", show_alert=True)
-            try:
+            with contextlib.suppress(TelegramAPIError):
                 await call.message.delete()
-            except TelegramAPIError:
-                pass
             return
         if picked != pending["answer"]:
             await call.answer("Неверно.", show_alert=True)
@@ -903,10 +928,8 @@ class TelegramAdapter(PaymentsMixin):
             return
         self._captcha.pop((chat_id, user_id), None)
         await self.storage.set_verified(chat_id, user_id)
-        try:
+        with contextlib.suppress(TelegramAPIError):
             await call.message.delete()
-        except TelegramAPIError:
-            pass
         await call.answer("Спасибо, проверка пройдена!")
 
     async def on_profilecheck(self, message: Message, command: CommandObject) -> None:
@@ -1175,153 +1198,192 @@ class TelegramAdapter(PaymentsMixin):
         await self.handle_comment(message, edited=True)
 
     async def handle_comment(self, message: Message, edited: bool = False) -> None:
+        """One comment from arrival to action. Each step is a method of its own and may end the story early."""
+        text = await self._text_to_judge(message, edited)
+        if text is None:
+            return
+        incoming = await self._identify(message, edited, text)
+        if incoming is None:
+            return
+        config = ChatConfig.from_row(incoming.chat)
+        prepared = await self._prepare(incoming, config)
+        decision = await self._decide(incoming, prepared, config)
+        await self._conclude(incoming, prepared, config, decision)
+
+    async def _text_to_judge(self, message: Message, edited: bool) -> str | None:
+        """The text of a member's message, or None when there is nothing to judge (posts, service messages, edits of media)."""
         if message.is_automatic_forward:
             if not edited:
                 await self.remember_post(message)
-            return
+            return None
         kind = getattr(message.content_type, "value", message.content_type)
         if kind in SERVICE_KINDS:
             if not edited:
                 await self.handle_service(message, kind)
-            return
+            return None
         text = message.text or message.caption
         if not text and (edited or not media_label(message)):
-            return  # nothing to judge, and not a member's own message either (service messages, edits of media)
-        text = text or ""  # stickers, photos and the like still count for the antiflood
+            return None  # nothing to judge, and not a member's own message either
+        return text or ""  # stickers, photos and the like still count for the antiflood
+
+    async def _identify(self, message: Message, edited: bool, text: str) -> "Incoming | None":
+        """Who wrote it. None for everything that is not moderated: a disabled chat, admins, the chat's own channel,
+        other bots and trusted people."""
         chat_id = message.chat.id
         chat = await self.storage.get_chat(chat_id)
         if chat and not chat["enabled"]:
-            return
-
+            return None
         sender, user = message.sender_chat, message.from_user
         if sender:
             # Posted on behalf of a channel. Anonymous admins (the group itself) and the group's own
             # channel are fine; any other channel is a stranger and is moderated like a person.
             if sender.id == chat_id:
-                await self.note_admin_reply(message, edited)
-                await self.trial_test(message, chat, edited)
-                return
+                await self._admin_wrote(message, chat, edited)
+                return None
             if sender.id == await self.linked_channel(chat_id):
-                return
-            author_id, author_name, username, premium = sender.id, sender.title or "Канал", sender.username, False
+                return None
+            who = Incoming(message, edited, text, chat, sender.id, sender.title or "Канал", sender.username, False, True)
         elif user and not user.is_bot:
             if await self.is_admin(chat_id, user.id):
-                await self.note_admin_reply(message, edited)
-                await self.trial_test(message, chat, edited)
-                return
-            author_id, author_name, username, premium = user.id, user.full_name, user.username, bool(user.is_premium)
+                await self._admin_wrote(message, chat, edited)
+                return None
+            who = Incoming(message, edited, text, chat, user.id, user.full_name, user.username, bool(user.is_premium), False)
         else:
-            return  # other bots
-        if await self.storage.is_trusted(chat_id, author_id):
-            return
+            return None  # other bots
+        if await self.storage.is_trusted(chat_id, who.author_id):
+            return None
+        return who
 
-        config = ChatConfig.from_row(chat)
-        previous = await self.storage.message_count(chat_id, author_id)
+    async def _admin_wrote(self, message: Message, chat, edited: bool) -> None:
+        await self.note_admin_reply(message, edited)
+        await self.trial_test(message, chat, edited)
+
+    async def _prepare(self, who: "Incoming", config: ChatConfig) -> "Prepared":
+        """Everything the decision needs: history of the author, picture text, memory of earlier decisions,
+        the post and the message replied to, the profile of a newcomer."""
+        message, chat_id = who.message, who.message.chat.id
+        previous = await self.storage.message_count(chat_id, who.author_id)
+        newcomer = previous < NEWCOMER_MESSAGES
+        plain = not config.lockdown and not config.blanket
         image_text = None
-        if (
-            config.image_ocr and self.ocr.available and not sender and not edited
-            and previous < NEWCOMER_MESSAGES and not config.lockdown and not config.blanket
-        ):
+        if config.image_ocr and self.ocr.available and not who.is_channel and not who.edited and newcomer and plain:
             image_text = await self.read_image_text(message)
-        key = example_key(text or image_text or "")
+        key = example_key(who.text or image_text or "")
         known = await self.storage.example_kind(chat_id, key) if key else None
-        post_text, reply_to_text = (None, None)
-        if not config.lockdown and not config.blanket:
-            post_text, reply_to_text = await self.comment_context(message)
+        post_text, reply_to_text = await self.comment_context(message) if plain else (None, None)
         profile = None
-        if config.profile_check and not sender and previous < NEWCOMER_MESSAGES and not edited:
+        if config.profile_check and not who.is_channel and newcomer and not who.edited:
             try:
-                profile = await asyncio.wait_for(self.fetch_profile(author_id), PROFILE_TIMEOUT)
-            except asyncio.TimeoutError:
-                log.info("profile lookup of %s timed out", author_id)
+                profile = await asyncio.wait_for(self.fetch_profile(who.author_id), PROFILE_TIMEOUT)
+            except asyncio.TimeoutError:  # a different class from the builtin before Python 3.11
+                log.info("profile lookup of %s timed out", who.author_id)
         comment = Comment(
             chat_id=chat_id,
             message_id=message.message_id,
-            text=text,
+            text=who.text,
             author=Author(
-                user_id=author_id,
-                display_name=author_name,
-                username=username,
-                is_premium=premium,
+                user_id=who.author_id,
+                display_name=who.author_name,
+                username=who.username,
+                is_premium=who.premium,
                 previous_messages=previous,
-                previous_deletions=await self.storage.recent_deletions(chat_id, author_id),
+                previous_deletions=await self.storage.recent_deletions(chat_id, who.author_id),
                 profile=profile,
             ),
             post_text=post_text,
             reply_to_text=reply_to_text,
             links=self.extract_links(message),
-            seconds_after_post=await self.seconds_after_post(message) if config.first_strict and not edited else None,
+            seconds_after_post=await self.seconds_after_post(message) if config.first_strict and not who.edited else None,
             image_text=image_text,
         )
+        return Prepared(comment, key, known, previous, image_text)
 
-        if (
-            config.antiflood
-            and not edited
-            and self.flood_hit(chat_id, author_id, config.flood_messages, config.flood_window)
-        ):
-            decision = self.moderator.flood_decision(config.flood_mute_minutes)
-        else:
-            acc = await self.access_for(chat) if chat else None
-            ai = acc is None or acc.ai_allowed
-            try:
-                decision = await self.moderator.check(comment, config, known, ai=ai)
-                if decision.extra.get("no_ai"):
-                    await self.billing_alert(chat, acc)
-            except JevError as e:
-                log.error("Jev unavailable, using the local fallback filter: %s", e)
-                await self.notify_owner(
-                    chat,
-                    "jev_down",
-                    "⚠️ ИИ сейчас недоступен. Пока он не вернётся, работает упрощённая защита: "
-                    "только заведомый спам со ссылками. Остальные комментарии проходят без проверки.",
-                    JEV_ALERT_COOLDOWN,
-                )
-                decision = self.moderator.fallback(comment, config)
+    async def _decide(self, who: "Incoming", prepared: "Prepared", config: ChatConfig) -> Decision:
+        """Antiflood first (it costs nothing), then the moderator; the local filter when the AI is down."""
+        chat_id = who.message.chat.id
+        if config.antiflood and not who.edited and self.flood_hit(chat_id, who.author_id, config.flood_messages, config.flood_window):
+            return self.moderator.flood_decision(config.flood_mute_minutes)
+        access = await self.access_for(who.chat) if who.chat else None
+        try:
+            decision = await self.moderator.check(
+                prepared.comment, config, prepared.known, ai=access is None or access.ai_allowed
+            )
+        except JevError as e:
+            log.error("Jev unavailable, using the local fallback filter: %s", e)
+            await self.notify_owner(
+                who.chat,
+                "jev_down",
+                "⚠️ ИИ сейчас недоступен. Пока он не вернётся, работает упрощённая защита: "
+                "только заведомый спам со ссылками. Остальные комментарии проходят без проверки.",
+                JEV_ALERT_COOLDOWN,
+            )
+            return self.moderator.fallback(prepared.comment, config)
+        if decision.extra.get("no_ai") and access is not None:
+            await self.billing_alert(who.chat, access)
+        return decision
 
-        if not edited:
-            await self.storage.count_message(chat_id, author_id)
-            if text and decision.action not in DELETING_ACTIONS:
-                self.spawn(self.watch_thread(message, text, config, chat))
-        if image_text:
-            decision.extra["image_text"] = image_text
-        v = decision.verdict
-        if v is None:
-            if config.captcha and not sender and not edited and not config.observe and survived(decision):
-                await self.maybe_challenge(message, author_id, previous)
-            return  # nothing to record: skipped without asking Jev
-        log_id = await self.storage.add_log(
-            chat_id=chat_id,
-            message_id=message.message_id,
-            user_id=author_id,
-            user_name=author_name,
-            text=text or self.shown_text(message, decision) or media_label(message) or "[сообщение без текста]",
-            category=v.category.value,
-            confidence=v.confidence,
-            bot_probability=v.bot_probability,
-            action=decision.action.value,
-            reason=decision.reason,
-            tokens=v.input_tokens,
-            kind=v.kind,
-            lead=v.lead,
-            needs_answer=v.needs_answer,
-            sentiment=v.sentiment,
-            violation=v.violation_probability,
-        )
-        self.note_usage(chat_id, v.input_tokens)
-        log.info("chat=%s author=%s action=%s edited=%s %s", chat_id, author_id, decision.action.value, edited, v)
+    async def _conclude(self, who: "Incoming", prepared: "Prepared", config: ChatConfig, decision: Decision) -> None:
+        """Count the message, write the log, and carry the decision out (or only record it in the trial mode)."""
+        message, chat_id = who.message, who.message.chat.id
+        if not who.edited:
+            await self.storage.count_message(chat_id, who.author_id)
+            if who.text and decision.action not in DELETING_ACTIONS:
+                self.spawn(self.watch_thread(message, who.text, config, who.chat))
+        if prepared.image_text:
+            decision.extra["image_text"] = prepared.image_text
+        verdict = decision.verdict
+        if verdict is None:  # nothing to record: skipped without asking Jev
+            await self._challenge_if_due(who, prepared, config, decision, observe_blocks=True)
+            return
+        log_id = await self._write_log(who, decision, verdict)
+        log.info("chat=%s author=%s action=%s edited=%s %s", chat_id, who.author_id, decision.action.value, who.edited, verdict)
         if config.observe:
             await self.storage.set_executed(log_id, False)  # a dry run: recorded, not carried out
             if decision.action in DELETING_ACTIONS:
-                await self.trial_notice(message, decision, log_id, chat, author_name)
+                await self.trial_notice(message, decision, log_id, who.chat, who.author_name)
             return
-        if key and decision.action == ActionType.DELETE_AND_BAN and v.confidence >= AUTO_REMEMBER_CONFIDENCE:
-            await self.storage.add_example(chat_id, key, "remove")
-        if not await self.execute(message, decision, log_id, chat):
+        if prepared.key and decision.action == ActionType.DELETE_AND_BAN and verdict.confidence >= AUTO_REMEMBER_CONFIDENCE:
+            await self.storage.add_example(chat_id, prepared.key, "remove")
+        if not await self.execute(message, decision, log_id, who.chat):
             await self.storage.set_executed(log_id, False)
-        elif decision.action == ActionType.DELETE_AND_BAN and v.category.value == "spam" and not sender:
-            await self.learn_avatar(author_id)
-        if config.captcha and not sender and not edited and survived(decision):
-            await self.maybe_challenge(message, author_id, previous)
+        elif decision.action == ActionType.DELETE_AND_BAN and verdict.category.value == "spam" and not who.is_channel:
+            await self.learn_avatar(who.author_id)
+        await self._challenge_if_due(who, prepared, config, decision)
+
+    async def _write_log(self, who: "Incoming", decision: Decision, verdict: Verdict) -> int:
+        message = who.message
+        log_id = await self.storage.add_log(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            user_id=who.author_id,
+            user_name=who.author_name,
+            text=who.text or self.shown_text(message, decision) or media_label(message) or "[сообщение без текста]",
+            category=verdict.category.value,
+            confidence=verdict.confidence,
+            bot_probability=verdict.bot_probability,
+            action=decision.action.value,
+            reason=decision.reason,
+            tokens=verdict.input_tokens,
+            kind=verdict.kind,
+            lead=verdict.lead,
+            needs_answer=verdict.needs_answer,
+            sentiment=verdict.sentiment,
+            violation=verdict.violation_probability,
+        )
+        if verdict.input_tokens > 0:
+            await self.storage.add_usage(message.chat.id)
+        self.note_usage(message.chat.id, verdict.input_tokens)
+        return log_id
+
+    async def _challenge_if_due(
+        self, who: "Incoming", prepared: "Prepared", config: ChatConfig, decision: Decision, observe_blocks: bool = False
+    ) -> None:
+        """The "I am a human" check for a newcomer whose message stayed."""
+        if not config.captcha or who.is_channel or who.edited or not survived(decision):
+            return
+        if observe_blocks and config.observe:
+            return
+        await self.maybe_challenge(who.message, who.author_id, prepared.previous)
 
     async def trial_notice(self, message: Message, decision: Decision, log_id: int, chat, name: str) -> None:
         """Trial mode: show the owner the first few things the bot would remove, with a verdict button."""
@@ -1407,10 +1469,8 @@ class TelegramAdapter(PaymentsMixin):
             if count:
                 await self.raid_alert(chat_id, chat, count)
         if config.clean_service and not config.observe and kind in CLEANABLE_SERVICE:
-            try:
+            with suppress(TelegramAPIError):  # no right to delete, or already gone
                 await message.delete()
-            except TelegramAPIError:
-                pass  # no right to delete, or already gone
 
     def raid_count(self, chat_id: int, joined: int) -> int | None:
         """Register joins; the number of people who joined in the last minute once it looks like a raid, else None."""
@@ -1468,10 +1528,8 @@ class TelegramAdapter(PaymentsMixin):
     async def on_spam_report(self, message: Message) -> None:
         """A member replies `/spam` to a comment. Enough different people complaining sends it to the owner."""
         target, user = message.reply_to_message, message.from_user
-        try:
+        with suppress(TelegramAPIError):
             await message.delete()  # the complaint itself should not stay in the chat
-        except TelegramAPIError:
-            pass
         if not target or not user or target.from_user is None and target.sender_chat is None:
             return
         offender = target.from_user
@@ -1596,6 +1654,19 @@ class TelegramAdapter(PaymentsMixin):
         except Exception:  # background task: never let it crash the handler
             log.exception("Conflict check failed")
 
+    @staticmethod
+    async def tg_retry(call, *args, **kwargs):
+        """Run a Telegram request; when Telegram asks to slow down (flood control), wait and try once more.
+        Without it a spam raid loses its removals exactly when they matter most."""
+        try:
+            return await call(*args, **kwargs)
+        except TelegramRetryAfter as e:
+            if e.retry_after > MAX_RETRY_WAIT:
+                raise
+            log.warning("Telegram flood control: waiting %ss", e.retry_after)
+            await asyncio.sleep(e.retry_after + 0.5)
+            return await call(*args, **kwargs)
+
     async def execute(self, message: Message, decision: Decision, log_id: int, chat) -> bool:
         """Carry the decision out. Returns False when Telegram refused (usually missing admin rights)."""
         action = decision.action
@@ -1606,17 +1677,18 @@ class TelegramAdapter(PaymentsMixin):
         shown = message.text or message.caption
         try:
             if action in DELETING_ACTIONS:
-                await message.delete()
+                await self.tg_retry(message.delete)
             # A channel cannot be warned or muted, so any removal of its comment bans the channel.
             if action == ActionType.DELETE_AND_BAN or (sender and action in DELETING_ACTIONS):
                 if sender:
-                    await self.bot.ban_chat_sender_chat(message.chat.id, sender.id)
+                    await self.tg_retry(self.bot.ban_chat_sender_chat, message.chat.id, sender.id)
                 else:
-                    await self.bot.ban_chat_member(message.chat.id, user.id)
+                    await self.tg_retry(self.bot.ban_chat_member, message.chat.id, user.id)
             elif action in (ActionType.DELETE_AND_EXPLAIN, ActionType.DELETE_AND_MUTE) and not sender:
                 hours = decision.extra.get("mute_hours")
                 if hours:
-                    await self.bot.restrict_chat_member(
+                    await self.tg_retry(
+                        self.bot.restrict_chat_member,
                         message.chat.id,
                         user.id,
                         permissions=ChatPermissions(can_send_messages=False),
@@ -1638,7 +1710,7 @@ class TelegramAdapter(PaymentsMixin):
                     owner_id,
                     f"🤔 Не уверен насчёт комментария в чате «{title}»\n"
                     f"Автор: {html.escape(name)}. Причина: {html.escape(decision.reason)}. "
-                    f"Бот уверен на {v.confidence:.0%}:\n"
+                    f"Бот уверен на {(v.confidence if v else 0):.0%}:\n"
                     f"{quote(self.shown_text(message, decision))}\n{chat_message_link(message.chat.id, message.message_id, message.chat.username)}",
                     kb([("🗑 Удалить", f"rev:del:{log_id}"), ("✅ Оставить", f"rev:keep:{log_id}")]),
                 )

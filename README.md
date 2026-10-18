@@ -112,7 +112,9 @@ python main.py
 ## Тесты
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt -c constraints.txt ruff mypy
+ruff check core adapters webapp main.py scripts tests
+mypy
 pytest
 python -m scripts.try_jev   # живой прогон, тратит токены Jev
 ```

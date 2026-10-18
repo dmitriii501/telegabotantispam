@@ -8,7 +8,7 @@ from aiogram.filters import CommandObject
 from core.billing import DAY, PLANS, TERMS, TRIAL_CHECKS, TRIAL_DAYS, access, extend, price
 from core.models import ActionType, Author, Comment
 from core.moderation import ChatConfig, Moderator
-from tests.test_handlers import CHAT, OWNER, SPAM, SPAM_BOT, answer, env, last_log, msg, sent_to  # noqa: F401
+from tests.test_handlers import CHAT, OWNER, SPAM, answer, msg, sent_to
 
 NOW = 1_800_000_000
 ADMIN = 1  # the admin of tests.test_handlers
@@ -91,10 +91,34 @@ async def test_refund_takes_the_months_back(env):
     assert (await env.storage.revenue())["stars"] == 0
 
 
-async def test_ai_checks_count_only_comments_the_ai_read(env):
+async def test_usage_is_counted_per_day_and_outlives_the_log(env):
+    await env.storage.add_usage(CHAT)
+    await env.storage.add_usage(CHAT, 2)
+    assert await env.storage.ai_checks(CHAT, 0) == 3
+    old = int(time.time()) - 40 * DAY
+    await env.storage.db.execute("INSERT INTO usage (chat_id, day, checks) VALUES (?, ?, 50)", (CHAT, old // DAY * DAY))
+    await env.storage.db.commit()
+    assert await env.storage.ai_checks(CHAT, int(time.time()) - 30 * DAY) == 3, "only the last 30 days count"
+    await env.storage.purge_old(1)  # the log is wiped after a day, the usage of the month stays
+    assert await env.storage.ai_checks(CHAT, int(time.time()) - 30 * DAY) == 3
+    assert await env.storage.ai_checks(CHAT + 1, 0) == 0
+
+
+async def test_an_old_database_gets_its_usage_from_the_log(env):
     for tokens in (0, 900, 1200):
         await env.storage.add_log(chat_id=CHAT, message_id=1, user_id=5, text="x", action="none", tokens=tokens)
-    assert await env.storage.ai_checks(CHAT, 0) == 2
+    await env.storage.close()
+    await env.storage.open()
+    assert await env.storage.ai_checks(CHAT, 0) == 2, "only comments with token usage were read by the AI"
+    await env.storage.close()
+    await env.storage.open()
+    assert await env.storage.ai_checks(CHAT, 0) == 2, "seeded once, not on every start"
+
+
+async def test_every_ai_read_comment_is_counted_in_the_usage_table(env):
+    adapter, _ = env.build(answer())
+    await adapter.handle_comment(msg("Расскажите про курс подробнее"))
+    assert await env.storage.ai_checks(CHAT, 0) == 1
 
 
 # ------------------------------------------------------------- moderator
@@ -195,7 +219,7 @@ async def test_pre_checkout_accepts_only_the_real_price(env):
     await adapter.on_pre_checkout(q)
     q.answer.assert_awaited_once_with(ok=True, error_message=None)
     for payload, amount, currency in [(good, 1, "XTR"), (good, price(PLANS["start"], 1), "USD"), ("junk", 5, "XTR"),
-                                      (f"{CHAT}:gold:1", 5, "XTR"), (f"{CHAT}:start:7", 5, "XTR"), (f"-5:start:1", price(PLANS["start"], 1), "XTR")]:
+                                      (f"{CHAT}:gold:1", 5, "XTR"), (f"{CHAT}:start:7", 5, "XTR"), ("-5:start:1", price(PLANS["start"], 1), "XTR")]:
         bad = pre_checkout(payload, amount, currency)
         await adapter.on_pre_checkout(bad)
         assert bad.answer.await_args.kwargs["ok"] is False, (payload, amount, currency)

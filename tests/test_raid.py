@@ -9,8 +9,9 @@ from aiogram.filters import CommandObject
 
 from adapters.telegram import bot as botmod
 from core.moderation import ChatConfig
-from tests.test_handlers import ADMIN_ID, CHAT, OWNER, answer, env, msg, sent_to  # noqa: F401
-from tests.test_webapp import CHAT as WEB_CHAT, client, h  # noqa: F401
+from tests.test_handlers import ADMIN_ID, CHAT, OWNER, answer, msg, sent_to
+from tests.test_webapp import CHAT as WEB_CHAT  # noqa: F401
+from tests.test_webapp import h
 
 
 def service(kind, joined=1, user_id=5, i=0):
