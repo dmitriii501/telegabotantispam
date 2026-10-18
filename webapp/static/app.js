@@ -713,10 +713,7 @@ function renderSettings() {
     if (t.dataset.seg) saveSetting(t.dataset.seg, t.dataset.v);
     if (t.dataset.linksMode) saveLinks({ mode: t.dataset.linksMode });
     if (t.id === "copyGo") copySettings();
-    if (t.dataset.pay) {
-      if (tg.openTelegramLink) tg.openTelegramLink(t.dataset.pay);
-      else window.open(t.dataset.pay, "_blank");
-    }
+    if (t.dataset.pay) openPayment(t);
     if (t.dataset.untrust) untrust(Number(t.dataset.untrust));
   };
   view.onchange = (e) => {
@@ -744,6 +741,28 @@ function renderSettings() {
       saveSetting(e.target.dataset.int, value);
     }
   };
+}
+
+// The bot writes the plans to the admin's chat with it; opening a link to the same bot from inside its own
+// panel is unreliable in Telegram, so the link is only the fallback.
+async function openPayment(button) {
+  const link = button.dataset.pay;
+  button.disabled = true;
+  try {
+    const res = await api("POST", `/chat/${state.chatId}/pay`);
+    if (res.sent) {
+      toast("Варианты оплаты отправил вам в чат с ботом 💳");
+      haptic("success");
+      setTimeout(() => (tg.close ? tg.close() : null), 1400);
+      return;
+    }
+  } catch (e) {
+    /* fall through to the link */
+  } finally {
+    button.disabled = false;
+  }
+  if (tg.openTelegramLink) tg.openTelegramLink(link);
+  else window.open(link, "_blank");
 }
 
 async function untrust(userId) {

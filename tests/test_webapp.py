@@ -255,3 +255,14 @@ async def test_bank_notification_route_needs_no_login_but_the_signature_decides(
     assert r.status == 400
     assert (await client.post("/tbank/notify", data="not json")).status == 400
     assert (await client.post("/tbank/notify", json=[1, 2])).status == 400
+
+
+async def test_pay_button_asks_the_bot_to_write_the_plans(client):
+    client.adapter.show_plans = AsyncMock(return_value=True)
+    r = await client.post(f"/api/chat/{CHAT}/pay", headers=h())
+    assert r.status == 200 and (await r.json()) == {"sent": True}
+    client.adapter.show_plans.assert_awaited_once_with(42, CHAT)
+    client.adapter.show_plans = AsyncMock(return_value=False)  # the admin never pressed Start
+    assert (await (await client.post(f"/api/chat/{CHAT}/pay", headers=h())).json()) == {"sent": False}
+    assert (await client.post(f"/api/chat/{CHAT}/pay")).status == 401
+    assert (await client.post(f"/api/chat/{CHAT}/pay", headers=h({"id": 7, "first_name": "X"}))).status == 403

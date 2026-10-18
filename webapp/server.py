@@ -234,6 +234,15 @@ async def billing_payload(adapter, chat) -> dict:
     }
 
 
+async def open_payment(request: web.Request) -> web.Response:
+    """The panel's "choose a plan": the bot sends the plans to the admin's private chat.
+    `sent` is False when the bot cannot write to them yet (they never pressed Start): the panel then opens the link."""
+    chat = await admin_chat(request, fresh=True)
+    adapter = request.app["adapter"]
+    sent = await adapter.show_plans(request["user"]["id"], chat["chat_id"])
+    return web.json_response({"sent": bool(sent)})
+
+
 async def get_chat(request: web.Request) -> web.Response:
     chat = await admin_chat(request)
     adapter = request.app["adapter"]
@@ -454,6 +463,7 @@ def create_app(adapter, bot_token: str) -> web.Application:
     app.router.add_put("/api/chat/{chat_id}/settings", put_settings)
     app.router.add_put("/api/chat/{chat_id}/links", put_links)
     app.router.add_post("/api/chat/{chat_id}/copy", copy_settings)
+    app.router.add_post("/api/chat/{chat_id}/pay", open_payment)
     app.router.add_post("/api/chat/{chat_id}/parse", parse_text)
     app.router.add_get("/api/chat/{chat_id}/log", get_log)
     app.router.add_get("/api/chat/{chat_id}/insights", get_insights)

@@ -213,11 +213,11 @@ class PaymentsMixin:
         await self.show_plans(message.from_user.id, chat_id)
         return True
 
-    async def show_plans(self, user_id: int, chat_id: int, method: str | None = None) -> None:
+    async def show_plans(self, user_id: int, chat_id: int, method: str | None = None) -> bool:
         """The plans and, when roubles are connected, first the choice between card and Stars."""
         chat = await self.storage.get_chat(chat_id)
         if not chat:
-            return
+            return False
         acc = await self.access_for(chat)
         title = html.escape(await self.chat_title(chat_id))
         lines = [f"💳 <b>Тариф для чата «{title}»</b>", self.access_text(acc), ""]
@@ -248,7 +248,7 @@ class PaymentsMixin:
                         text=f"{plan.title} · {label} — {cost}",
                         callback_data=f"{'rub' if method == 'rub' else 'buy'}:{chat_id}:{plan.key}:{months}",
                     )])
-        await self.dm(user_id, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+        return await self.dm(user_id, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
     async def on_method_button(self, call: CallbackQuery) -> None:
         _, chat_id, method = call.data.split(":")
