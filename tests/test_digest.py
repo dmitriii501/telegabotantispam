@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from adapters.telegram.bot import TelegramAdapter, describe_rules
+from adapters.telegram.bot import TelegramAdapter
+from adapters.telegram.common import describe_rules
 from core.rules import EVERYTHING, PERMISSION, PROHIBITION, Rule
 from core.storage import Storage
 

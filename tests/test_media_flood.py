@@ -1,7 +1,7 @@
 """Stickers, photos and other messages without text count for the antiflood; service messages do not."""
 
 
-from adapters.telegram import bot as botmod
+from adapters.telegram import common as botmod
 from tests.test_handlers import CHAT, OWNER, answer, msg, sent_to
 
 

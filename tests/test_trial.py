@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from aiogram.exceptions import TelegramForbiddenError
 
-from adapters.telegram import bot as botmod
+from adapters.telegram import common as botmod
 from core.normalizer import example_key
 from tests.test_handlers import ADMIN_ID, CHAT, OWNER, SPAM_BOT, answer, msg, sent_to
 

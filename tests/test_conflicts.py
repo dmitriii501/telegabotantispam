@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from adapters.telegram import bot as botmod
+from adapters.telegram import common as botmod
 from adapters.telegram.bot import TelegramAdapter
 from core.moderation import ChatConfig
 from core.storage import Storage

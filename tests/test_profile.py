@@ -10,7 +10,7 @@ import pytest
 from aiogram.exceptions import TelegramBadRequest
 from PIL import Image, ImageDraw
 
-from adapters.telegram import bot as botmod
+from adapters.telegram import pipeline
 from core.avatar import dhash, distance, similar
 from core.models import ActionType, Author, Category, Comment, Profile, Verdict
 from core.moderation import MODES, ChatConfig, Moderator, build_questions, build_state, decide
@@ -250,7 +250,7 @@ async def test_a_slow_lookup_does_not_hold_the_message(env, monkeypatch):
         await asyncio.sleep(1)
 
     env.bot.get_user_profile_photos = AsyncMock(side_effect=slow)
-    monkeypatch.setattr(botmod, "PROFILE_TIMEOUT", 0.05)
+    monkeypatch.setattr(pipeline, "PROFILE_TIMEOUT", 0.05)
     adapter, jev = env.build(answer())
     await adapter.handle_comment(msg("Привет всем", user_id=35))
     assert len(jev.calls) == 1

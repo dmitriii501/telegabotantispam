@@ -6,7 +6,7 @@ import pytest
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
 
-from adapters.telegram import bot as botmod
+from adapters.telegram import common as botmod
 from adapters.telegram.bot import TelegramAdapter
 from core.jev_client import JevError
 from core.moderation import Moderator
@@ -311,7 +311,7 @@ async def test_a_flood_control_pause_from_telegram_is_waited_out(env, monkeypatc
     async def fake_sleep(seconds):
         waits.append(seconds)
 
-    monkeypatch.setattr("adapters.telegram.bot.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
     adapter, _ = env.build(SPAM)
     m = msg("Реклама моего канала t.me/x")
     m.delete = AsyncMock(side_effect=[TelegramRetryAfter(DeleteMessage(chat_id=1, message_id=1), "Flood", 3), None])

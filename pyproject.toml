@@ -21,4 +21,4 @@ ignore_missing_imports = true
 warn_unused_ignores = true
 # The adapter's handlers read aiogram's Optional fields (message.from_user, callback.message) without narrowing:
 # about 90 findings, none of them seen in practice (group messages always have a sender). Tracked as debt in docs/audit.md.
-files = ["core", "webapp"]
+files = ["core", "webapp", "adapters", "main.py"]

@@ -11,7 +11,6 @@ import re
 import secrets
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING
 
 from aiogram import F
 from aiogram.enums import ChatType
@@ -26,6 +25,11 @@ from aiogram.types import (
     PreCheckoutQuery,
 )
 
+from adapters.telegram.base import AdapterBase
+from adapters.telegram.common import (
+    callback_data,
+    user_of,
+)
 from core.billing import DAY, PERIOD_DAYS, PLANS, REFUND_DAYS, TERMS, TRIAL_DAYS, Access, access, price, price_rub
 from core.models import DELETING_ACTIONS
 from core.moderation import MOSCOW
@@ -75,26 +79,8 @@ def link_button(text: str, url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, url=url)]])
 
 
-if TYPE_CHECKING:
-    from aiogram import Bot
-
-    from core.storage import Storage
-
-
-class PaymentsMixin:
-    """Mixed into TelegramAdapter; relies on what the adapter provides, declared here for the type checker."""
-
-    if TYPE_CHECKING:
-        bot: Bot
-        storage: Storage
-
-        async def dm(self, user_id: int | None, text: str, markup: InlineKeyboardMarkup | None = None) -> bool: ...
-        async def is_admin(self, chat_id: int, user_id: int, fresh: bool = False) -> bool: ...
-        async def is_admin_message(self, message: Message) -> bool: ...
-        async def chat_title(self, chat_id: int) -> str: ...
-        async def notify_owner(
-            self, chat, key: str, text: str, cooldown: float, markup: InlineKeyboardMarkup | None = None
-        ) -> None: ...
+class PaymentsMixin(AdapterBase):
+    """Selling the service: plan status, payments, notices. Part of the adapter."""
 
     def _init_payments(self) -> None:
         self.bot_username: str | None = None  # set at startup; deep links to the payment screen need it
@@ -193,7 +179,7 @@ class PaymentsMixin:
         await message.reply(f"💳 {self.access_text(acc)}\nID чата: <code>{message.chat.id}</code>", reply_markup=markup)
 
     async def plan_in_private(self, message: Message) -> None:
-        chats = await self.storage.chats_of_owner(message.from_user.id)
+        chats = await self.storage.chats_of_owner(user_of(message).id)
         if not chats:
             await message.answer(
                 "У вас пока нет чатов с ботом. Добавьте меня в группу обсуждений канала, сделайте админом "
@@ -201,7 +187,7 @@ class PaymentsMixin:
             )
             return
         if len(chats) == 1:
-            await self.show_plans(message.from_user.id, chats[0]["chat_id"])
+            await self.show_plans(user_of(message).id, chats[0]["chat_id"])
             return
         rows = []
         for chat in chats:
@@ -212,7 +198,7 @@ class PaymentsMixin:
         await message.answer("Для какого чата тариф?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
     async def on_plan_button(self, call: CallbackQuery) -> None:
-        chat_id = int(call.data.split(":")[1])
+        chat_id = int(callback_data(call).split(":")[1])
         if not await self.is_admin(chat_id, call.from_user.id, fresh=True):
             await call.answer("Оплатить может только админ этого чата.", show_alert=True)
             return
@@ -226,10 +212,10 @@ class PaymentsMixin:
         except ValueError:
             return False
         chat = await self.storage.get_chat(chat_id)
-        if not chat or not await self.is_admin(chat_id, message.from_user.id, fresh=True):
+        if not chat or not await self.is_admin(chat_id, user_of(message).id, fresh=True):
             await message.answer("Оплатить тариф может только админ этого чата. Откройте ссылку из чата, где вы админ.")
             return True
-        await self.show_plans(message.from_user.id, chat_id)
+        await self.show_plans(user_of(message).id, chat_id)
         return True
 
     async def show_plans(self, user_id: int, chat_id: int, method: str | None = None) -> bool:
@@ -270,8 +256,8 @@ class PaymentsMixin:
         return await self.dm(user_id, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
     async def on_method_button(self, call: CallbackQuery) -> None:
-        _, chat_id, method = call.data.split(":")
-        chat_id = int(chat_id)
+        _, raw_chat, method = callback_data(call).split(":")
+        chat_id = int(raw_chat)
         if method not in ("rub", "stars") or not await self.is_admin(chat_id, call.from_user.id, fresh=True):
             await call.answer("Оплатить может только админ этого чата.", show_alert=True)
             return
@@ -311,7 +297,7 @@ class PaymentsMixin:
         return await self.bot.create_invoice_link(**await self.invoice_fields(chat_id, plan_key, months))
 
     async def on_buy_button(self, call: CallbackQuery) -> None:
-        parsed = self.parse_payload(call.data.split(":", 1)[1])
+        parsed = self.parse_payload(callback_data(call).split(":", 1)[1])
         if not parsed:
             await call.answer("Некорректный выбор.", show_alert=True)
             return
@@ -364,6 +350,8 @@ class PaymentsMixin:
 
     async def on_paid(self, message: Message) -> None:
         pay = message.successful_payment
+        if pay is None:
+            return
         parsed = self.parse_payload(pay.invoice_payload)
         if not parsed:
             log.error("Paid an unknown payload %r (charge %s)", pay.invoice_payload, pay.telegram_payment_charge_id)
@@ -371,7 +359,7 @@ class PaymentsMixin:
             return
         chat_id, plan_key, months = parsed
         thanks = await self.complete_payment(
-            pay.telegram_payment_charge_id, chat_id, message.from_user.id, plan_key, months, pay.total_amount, "XTR"
+            pay.telegram_payment_charge_id, chat_id, user_of(message).id, plan_key, months, pay.total_amount, "XTR"
         )
         if thanks:
             await message.answer(thanks)
@@ -379,13 +367,13 @@ class PaymentsMixin:
     # ------------------------------------------------------- roubles (T-Bank)
 
     async def waiting_for_email(self, message: Message) -> bool:
-        entry = self._awaiting_email.get(message.from_user.id) if message.from_user else None
+        entry = self._awaiting_email.get(user_of(message).id) if message.from_user else None
         if not entry or time.time() - entry[3] > EMAIL_WAIT:
             return False
         return not (message.text or "").startswith("/")
 
     async def on_rub_button(self, call: CallbackQuery) -> None:
-        parsed = self.parse_payload(call.data.split(":", 1)[1])
+        parsed = self.parse_payload(callback_data(call).split(":", 1)[1])
         if not parsed or not self.tbank:
             await call.answer("Оплата картой пока недоступна. Выберите звёзды или напишите /paysupport.", show_alert=True)
             return
@@ -407,7 +395,7 @@ class PaymentsMixin:
         )
 
     async def on_email_message(self, message: Message) -> None:
-        user_id = message.from_user.id
+        user_id = user_of(message).id
         email = (message.text or "").strip()
         if not EMAIL.match(email):
             await message.answer("Не похоже на e-mail. Пришлите адрес ещё раз, например name@mail.ru")
@@ -418,7 +406,7 @@ class PaymentsMixin:
 
     async def on_email_command(self, message: Message, command: CommandObject) -> None:
         """/email shows the e-mail used for receipts, /email name@mail.ru changes it, /email delete forgets it."""
-        user_id = message.from_user.id
+        user_id = user_of(message).id
         arg = (command.args or "").strip()
         if arg in ("delete", "удалить"):
             await self.storage.set_email(user_id, None)
@@ -510,7 +498,7 @@ class PaymentsMixin:
     # ---------------------------------------------------------- the operator's tools
 
     def is_operator(self, message: Message) -> bool:
-        return bool(message.from_user and message.from_user.id in self.operators)
+        return bool(message.from_user and user_of(message).id in self.operators)
 
     async def on_grant(self, message: Message, command: CommandObject) -> None:
         """/grant <chat id> <days> [plan]: access by hand (a card payment, a gift, a partner). Negative days take it back."""

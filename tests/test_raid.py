@@ -7,7 +7,7 @@ import pytest
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandObject
 
-from adapters.telegram import bot as botmod
+from adapters.telegram import common as botmod
 from core.moderation import ChatConfig
 from tests.test_handlers import ADMIN_ID, CHAT, OWNER, answer, msg, sent_to
 from tests.test_webapp import CHAT as WEB_CHAT  # noqa: F401

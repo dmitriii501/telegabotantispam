@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 from aiogram.exceptions import TelegramBadRequest
 
-from adapters.telegram import bot as botmod
+from adapters.telegram import common as botmod
+from adapters.telegram import newcomers
 from tests.test_handlers import CHAT, SPAM_BOT, answer, msg, sent_to
 
 USEFUL = answer("useful", 0.95)
@@ -166,7 +167,7 @@ async def test_only_the_addressed_person_can_press(env):
 
 
 async def test_no_answer_in_time_removes_the_message_and_mutes(env, monkeypatch):
-    monkeypatch.setattr(botmod, "CAPTCHA_TIMEOUT", 0.05)
+    monkeypatch.setattr(newcomers, "CAPTCHA_TIMEOUT", 0.05)
     adapter, _ = await captcha_env(env, answer())
     await adapter.handle_comment(msg("Всем привет", user_id=83, message_id=43))
     await asyncio.sleep(0.3)
@@ -176,7 +177,7 @@ async def test_no_answer_in_time_removes_the_message_and_mutes(env, monkeypatch)
 
 
 async def test_an_answer_in_time_cancels_the_timeout_effect(env, monkeypatch):
-    monkeypatch.setattr(botmod, "CAPTCHA_TIMEOUT", 0.15)
+    monkeypatch.setattr(newcomers, "CAPTCHA_TIMEOUT", 0.15)
     adapter, _ = await captcha_env(env, answer())
     await adapter.handle_comment(msg("Всем привет", user_id=84))
     text, options = challenge(env)

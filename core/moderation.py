@@ -5,6 +5,7 @@ Everything here is platform-independent. Adapters build a `Comment`, call
 """
 
 import json
+import sqlite3
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -138,7 +139,7 @@ class ChatConfig:
         return MODES.get(self.mode, MODES["normal"])
 
     @classmethod
-    def from_row(cls, row: Mapping | None) -> "ChatConfig":
+    def from_row(cls, row: "Mapping[str, Any] | sqlite3.Row | None") -> "ChatConfig":
         if row is None:
             return cls()
         if row["rules_json"]:
@@ -193,7 +194,7 @@ def _json_list(value) -> list[str]:
     return [str(x) for x in data] if isinstance(data, list) else []
 
 
-def _lockdown_active(row: Mapping) -> bool:
+def _lockdown_active(row: Any) -> bool:
     """On, and either without an end time or before it (a freeze after a raid ends by itself)."""
     if not row["lockdown"]:
         return False
@@ -201,7 +202,7 @@ def _lockdown_active(row: Mapping) -> bool:
     return until == 0 or until > time.time()
 
 
-def _column(row: Mapping, name: str, default):
+def _column(row: Any, name: str, default):
     try:
         value = row[name]
     except (KeyError, IndexError):
