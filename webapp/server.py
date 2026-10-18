@@ -6,8 +6,11 @@ then asks Telegram whether that person is an admin of the requested chat, so
 there are no passwords and no separate accounts.
 """
 
+import contextlib
+import hmac
 import json
 import logging
+import os
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -18,6 +21,7 @@ from aiohttp import web
 from core.billing import DAY, PERIOD_DAYS, PLANS, TERMS, access, price, price_rub
 from core.jev_client import JevError
 from core.links import MAX_ENTRIES, normalize_entry
+from core.metrics import CHATS, DB_BYTES, METRICS, PENDING_REVIEWS
 from core.models import DELETING_ACTIONS, ActionType
 from core.moderation import MODES, ChatConfig
 from core.rules import ACTIONS, CONTEXT, EVERYTHING, PERMISSION, PROHIBITION, Rule, rules_to_json
@@ -186,6 +190,25 @@ async def tbank_notify(request: web.Request) -> web.Response:
         return web.Response(text="bad request", status=400)
     ok = isinstance(data, dict) and await request.app["adapter"].handle_tbank_notification(data)
     return web.Response(text="OK" if ok else "bad signature", status=200 if ok else 400)
+
+
+async def metrics(request: web.Request) -> web.Response:
+    """Numbers for Prometheus. Closed unless METRICS_TOKEN is set, and then only with that token."""
+    token = os.getenv("METRICS_TOKEN", "")
+    if not token:
+        raise web.HTTPNotFound()
+    if not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {token}"):
+        raise web.HTTPUnauthorized(text="token needed")
+    storage = request.app["adapter"].storage
+    counts = {"trial": 0, "paid": 0, "expired": 0}
+    for chat in await storage.all_chats():
+        counts[access(chat, 0).state] += 1
+    for state, n in counts.items():
+        CHATS.set(n, state=state)
+    PENDING_REVIEWS.set(await storage.pending_review_total())
+    with contextlib.suppress(OSError):
+        DB_BYTES.set(os.path.getsize(storage.path))
+    return web.Response(text=METRICS.render(), content_type="text/plain")
 
 
 async def index(request: web.Request) -> web.StreamResponse:
@@ -510,6 +533,7 @@ def create_app(adapter, bot_token: str) -> web.Application:
     app.router.add_get("/app", index)
     app.router.add_get("/app/", index)
     app.router.add_get("/health", health)
+    app.router.add_get("/metrics", metrics)
     app.router.add_post("/tbank/notify", tbank_notify)
     app.router.add_static("/static", STATIC)
     app.router.add_get("/api/chats", list_chats)

@@ -12,7 +12,7 @@ PUBLISHED = datetime(2026, 9, 29, 12, 0, 0, tzinfo=timezone.utc)
 
 
 class Jev:
-    async def ask(self, *args):
+    async def ask(self, *args, **kwargs):
         return BORDERLINE
 
 

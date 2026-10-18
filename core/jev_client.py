@@ -9,6 +9,9 @@ import time
 
 import aiohttp
 
+from core.fairness import FairLimiter, QueueFull
+from core.metrics import JEV_QUEUE, JEV_REQUESTS, JEV_RUNNING, JEV_SECONDS, JEV_WAIT_SECONDS, METRICS
+
 API_URL = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_MODEL = "jev-latest"
 
@@ -17,6 +20,10 @@ log = logging.getLogger(__name__)
 
 class JevError(Exception):
     pass
+
+
+class JevBusy(JevError):
+    """Too many requests are waiting for the AI at the moment (a raid in a chat): not an outage."""
 
 
 class JevClient:
@@ -39,7 +46,8 @@ class JevClient:
         breaker_pause: float = 30.0,
     ):
         self._api_url = api_url
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self.limiter = FairLimiter(max_concurrent)
+        METRICS.on_scrape(self._refresh_gauges)
         self._breaker_threshold = breaker_threshold
         self._breaker_pause = breaker_pause
         self._failures = 0
@@ -63,22 +71,51 @@ class JevClient:
     def healthy(self) -> bool:
         return time.monotonic() >= self._open_until
 
-    async def ask(self, state, questions: dict) -> dict:
-        """Send one request; return the raw response ({"answers": ..., "usage": ...})."""
+    def _refresh_gauges(self) -> None:
+        JEV_QUEUE.set(self.limiter.waiting)
+        JEV_RUNNING.set(self.limiter.running)
+
+    @property
+    def queued(self) -> int:
+        return self.limiter.waiting
+
+    async def ask(self, state, questions: dict, key=None) -> dict:
+        """Send one request; return the raw response ({"answers": ..., "usage": ...}).
+        `key` (the chat) is what the waiting line is shared by: a busy chat does not push the others back.
+        JevBusy when the line is too long to wait in: the caller falls back to the local filter."""
         if not self.healthy:
+            JEV_REQUESTS.inc(outcome="breaker_open")
             raise JevError("Jev temporarily disabled after repeated failures")
-        async with self._semaphore:
-            try:
-                result = await self._ask(state, questions)
-            except JevError:
-                self._failures += 1
-                if self._failures >= self._breaker_threshold:
-                    self._open_until = time.monotonic() + self._breaker_pause
-                    self._failures = 0
-                    log.error("Jev failed %d times in a row, pausing for %.0fs", self._breaker_threshold, self._breaker_pause)
-                raise
-            self._failures = 0
-            return result
+        queued_at = time.perf_counter()
+        try:
+            async with self.limiter.slot(key):
+                started = time.perf_counter()
+                JEV_WAIT_SECONDS.observe(started - queued_at)
+                try:
+                    result = await self._counted(state, questions)
+                except JevError:
+                    JEV_REQUESTS.inc(outcome="error")
+                    raise
+                JEV_SECONDS.observe(time.perf_counter() - started)
+                JEV_REQUESTS.inc(outcome="ok")
+                return result
+        except QueueFull as e:
+            JEV_REQUESTS.inc(outcome="busy")
+            raise JevBusy(str(e)) from None
+
+    async def _counted(self, state, questions: dict) -> dict:
+        """One request, with the circuit breaker's count of failures in a row."""
+        try:
+            result = await self._ask(state, questions)
+        except JevError:
+            self._failures += 1
+            if self._failures >= self._breaker_threshold:
+                self._open_until = time.monotonic() + self._breaker_pause
+                self._failures = 0
+                log.error("Jev failed %d times in a row, pausing for %.0fs", self._breaker_threshold, self._breaker_pause)
+            raise
+        self._failures = 0
+        return result
 
     async def _ask(self, state, questions: dict) -> dict:
         body = {"model": self._model, "state": state, "questions": questions}

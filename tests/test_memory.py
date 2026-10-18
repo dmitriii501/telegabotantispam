@@ -45,7 +45,7 @@ async def test_admin_decisions_are_remembered(storage):
 
 
 class NoJev:
-    async def ask(self, *args):
+    async def ask(self, *args, **kwargs):
         raise AssertionError("Jev must not be called for remembered comments")
 
 
@@ -64,7 +64,7 @@ async def test_remembered_comments_skip_jev():
 
 async def test_tension_parses_jev_score():
     class Jev:
-        async def ask(self, state, questions):
+        async def ask(self, state, questions, key=None):
             assert state["discussion"][0]["author"] == "Анна"
             return {"answers": {"tension": {"type": "score", "score": 1.8, "confidence": 0.9}}}
 

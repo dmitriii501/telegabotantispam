@@ -604,6 +604,10 @@ class Storage:
             n = await _first(cur)
         return n
 
+    async def pending_review_total(self) -> int:
+        async with self.db.execute("SELECT COUNT(*) FROM log WHERE action = 'send_to_review' AND feedback IS NULL") as cur:
+            return await _first(cur)
+
     async def top_reasons(self, chat_id: int, since: int, limit: int = 3) -> list[tuple[str, int]]:
         marks = ", ".join("?" for _ in DELETING)
         async with self.db.execute(

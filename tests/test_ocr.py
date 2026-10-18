@@ -111,7 +111,7 @@ class _Jev:
     def __init__(self, responses):
         self.responses, self.calls = list(responses) or [answer()], []
 
-    async def ask(self, state, questions):
+    async def ask(self, state, questions, key=None):
         self.calls.append((state, questions))
         return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
 

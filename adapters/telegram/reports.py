@@ -24,6 +24,7 @@ from adapters.telegram.common import (
 )
 from adapters.telegram.review import ReviewMixin
 from core.jev_client import JevError
+from core.metrics import METRICS
 from core.models import DELETING_ACTIONS, ActionType, Author, Comment
 from core.storage import DAY
 
@@ -173,10 +174,21 @@ class ReportsMixin(ReviewMixin):
         removed = await self.storage.purge_old(RETENTION_DAYS)
         log.info("Retention: removed %d log rows older than %d days", removed, RETENTION_DAYS)
 
+    def _log_metrics(self) -> None:
+        """Every five minutes one line with the counters, for those who read the log and not Prometheus."""
+        self._ticks = getattr(self, "_ticks", 0) + 1
+        if self._ticks % 5:
+            return
+        totals = METRICS.snapshot()
+        if totals != getattr(self, "_last_totals", None):
+            self._last_totals = totals
+            log.info("metrics %s", " ".join(f"{k}={v:g}" for k, v in sorted(totals.items())))
+
     async def digest_loop(self) -> None:
         while True:
             await asyncio.sleep(60)
             self.heartbeat = time.time()
+            self._log_metrics()
             now = datetime.now(timezone.utc)
             if now.hour == DIGEST_HOUR_UTC:
                 try:

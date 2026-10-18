@@ -145,7 +145,7 @@ class FakeJev:
         self.response = response
         self.calls = 0
 
-    async def ask(self, state, questions):
+    async def ask(self, state, questions, key=None):
         self.calls += 1
         return self.response
 

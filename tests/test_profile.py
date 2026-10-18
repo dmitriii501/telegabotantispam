@@ -127,7 +127,7 @@ def test_a_lure_profile_makes_a_spam_ban_more_likely():
 
 async def test_known_spammer_avatar_is_removed_without_asking_jev():
     class NoJev:
-        async def ask(self, *a):
+        async def ask(self, *a, **kw):
             raise AssertionError("Jev must not be called")
 
     author = Author(1, "Настя", previous_messages=0, profile=Profile(bio=None, has_photo=True, avatar_match=True))
@@ -142,7 +142,7 @@ async def test_avatar_shortcut_is_off_when_profile_check_is_off():
     class Jev:
         calls = 0
 
-        async def ask(self, *a):
+        async def ask(self, *a, **kw):
             Jev.calls += 1
             return answer()
 
@@ -153,7 +153,7 @@ async def test_avatar_shortcut_is_off_when_profile_check_is_off():
 
 async def test_established_members_with_a_matching_avatar_are_left_alone():
     class Jev:
-        async def ask(self, *a):
+        async def ask(self, *a, **kw):
             return answer()
 
     author = Author(1, "Настя", previous_messages=10, profile=Profile(avatar_match=True))

@@ -498,6 +498,7 @@ class Moderator:
         response = await self.jev.ask(
             build_state(comment, config.rules, config.allowed_domains),
             build_questions(prohibitions, config.analytics, profile=newcomer),
+            key=comment.chat_id,
         )
         return decide(
             parse_verdict(response),
@@ -567,8 +568,8 @@ class Moderator:
         response = await self.jev.ask({"rules_text": admin_text}, build_parse_questions(sentences))
         return parse_rules_response(sentences, response)
 
-    async def tension(self, messages: list[dict]) -> tuple[float, float]:
+    async def tension(self, messages: list[dict], key=None) -> tuple[float, float]:
         """How heated a discussion is: (score 0..2, confidence). `messages` are {"author", "text"} dicts."""
-        response = await self.jev.ask({"discussion": messages}, {"tension": TENSION_QUESTION})
+        response = await self.jev.ask({"discussion": messages}, {"tension": TENSION_QUESTION}, key=key)
         answer = response["answers"]["tension"]
         return float(answer["score"]), float(answer["confidence"])

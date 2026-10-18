@@ -36,11 +36,11 @@ chown -R defenceai:defenceai "$APP_DIR"
 chmod 600 "$APP_DIR/.env"
 
 cp deploy/defenceai.service /etc/systemd/system/$SERVICE.service
-cp deploy/defenceai-backup.service deploy/defenceai-backup.timer deploy/defenceai-health.service deploy/defenceai-health.timer /etc/systemd/system/
-chmod +x "$APP_DIR/deploy/backup.sh" "$APP_DIR/deploy/healthcheck.sh"
+cp deploy/defenceai-backup.service deploy/defenceai-backup.timer deploy/defenceai-health.service deploy/defenceai-health.timer deploy/defenceai-verify.service deploy/defenceai-verify.timer /etc/systemd/system/
+chmod +x "$APP_DIR/deploy/backup.sh" "$APP_DIR/deploy/healthcheck.sh" "$APP_DIR/deploy/verify-backup.sh"
 systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null
-systemctl enable --now defenceai-backup.timer defenceai-health.timer >/dev/null
+systemctl enable --now defenceai-backup.timer defenceai-health.timer defenceai-verify.timer >/dev/null
 systemctl restart "$SERVICE"
 echo
 echo "Installed. Status:  systemctl status $SERVICE    Logs:  journalctl -u $SERVICE -f"

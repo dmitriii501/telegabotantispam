@@ -31,6 +31,7 @@ from adapters.telegram.common import (
     user_of,
 )
 from core.billing import DAY, PERIOD_DAYS, PLANS, REFUND_DAYS, TERMS, TRIAL_DAYS, Access, access, price, price_rub
+from core.metrics import PAYMENT_AMOUNT, PAYMENTS
 from core.models import DELETING_ACTIONS
 from core.moderation import MOSCOW
 from core.tbank import EMAIL, TBank, TBankError, kopecks
@@ -335,6 +336,8 @@ class PaymentsMixin(AdapterBase):
         fresh = await self.storage.record_payment(charge_id, chat_id, payer_id, plan_key, months, amount, currency, email)
         if not fresh:
             return None
+        PAYMENTS.inc(currency=currency)
+        PAYMENT_AMOUNT.inc(amount, currency=currency)
         self._usage.pop(chat_id, None)
         chat = await self.storage.get_chat(chat_id)
         acc = await self.access_for(chat)

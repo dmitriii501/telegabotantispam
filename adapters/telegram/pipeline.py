@@ -47,7 +47,8 @@ from adapters.telegram.common import (
     user_of,
 )
 from adapters.telegram.settings import SettingsMixin
-from core.jev_client import JevError
+from core.jev_client import JevBusy, JevError
+from core.metrics import COMMENT_SECONDS, COMMENTS, TELEGRAM_ERRORS
 from core.models import DELETING_ACTIONS, ActionType, Author, Comment, Decision, Verdict
 from core.moderation import (
     NEWCOMER_MESSAGES,
@@ -202,10 +203,12 @@ class PipelineMixin(SettingsMixin):
         incoming = await self._identify(message, edited, text)
         if incoming is None:
             return
+        started = time.perf_counter()
         config = ChatConfig.from_row(incoming.chat)
         prepared = await self._prepare(incoming, config)
         decision = await self._decide(incoming, prepared, config)
         await self._conclude(incoming, prepared, config, decision)
+        COMMENT_SECONDS.observe(time.perf_counter() - started)
 
     async def _text_to_judge(self, message: Message, edited: bool) -> str | None:
         """The text of a member's message, or None when there is nothing to judge (posts, service messages, edits of media)."""
@@ -305,6 +308,9 @@ class PipelineMixin(SettingsMixin):
             decision = await self.moderator.check(
                 prepared.comment, config, prepared.known, ai=access is None or access.ai_allowed
             )
+        except JevBusy as e:  # a raid fills the line: the local filter does the work, the owner is not alarmed
+            log.warning("Jev line too long for chat %s, using the local fallback filter: %s", chat_id, e)
+            return self.moderator.fallback(prepared.comment, config)
         except JevError as e:
             log.error("Jev unavailable, using the local fallback filter: %s", e)
             await self.notify_owner(
@@ -322,6 +328,7 @@ class PipelineMixin(SettingsMixin):
     async def _conclude(self, who: "Incoming", prepared: "Prepared", config: ChatConfig, decision: Decision) -> None:
         """Count the message, write the log, and carry the decision out (or only record it in the trial mode)."""
         message, chat_id = who.message, who.message.chat.id
+        COMMENTS.inc(action=decision.action.value)
         if not who.edited:
             await self.storage.count_message(chat_id, who.author_id)
             if who.text and decision.action not in DELETING_ACTIONS:
@@ -478,7 +485,7 @@ class PipelineMixin(SettingsMixin):
                 return
             self._checked[thread] = now
             score, confidence = await self.moderator.tension(
-                [{"author": name, "text": t} for _, name, t in recent[-15:]]
+                [{"author": name, "text": t} for _, name, t in recent[-15:]], key=chat_id
             )
             if score < TENSION_ALERT or confidence < TENSION_MIN_CONFIDENCE:
                 return
@@ -553,6 +560,7 @@ class PipelineMixin(SettingsMixin):
                 )
             return True
         except TelegramAPIError as e:
+            TELEGRAM_ERRORS.inc(action=action.value)
             log.warning("Action %s failed in chat %s: %s", action.value, message.chat.id, e)
             if any(word in str(e).lower() for word in ("rights", "admin", "forbidden", "kicked")):
                 await self.notify_owner(

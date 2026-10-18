@@ -27,6 +27,7 @@ from adapters.telegram.common import (
     media_label,
     user_of,
 )
+from core.metrics import FLOOD_WAITS
 from core.models import Decision
 from core.moderation import (
     ChatConfig,
@@ -201,6 +202,7 @@ class AdapterBase:
         except TelegramRetryAfter as e:
             if e.retry_after > MAX_RETRY_WAIT:
                 raise
+            FLOOD_WAITS.inc()
             log.warning("Telegram flood control: waiting %ss", e.retry_after)
             await asyncio.sleep(e.retry_after + 0.5)
             return await call(*args, **kwargs)

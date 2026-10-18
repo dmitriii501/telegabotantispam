@@ -41,7 +41,7 @@ class ScriptedJev:
         self.responses = list(responses) or [answer()]
         self.calls = []
 
-    async def ask(self, state, questions):
+    async def ask(self, state, questions, key=None):
         self.calls.append((state, questions))
         item = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
         if isinstance(item, Exception):
@@ -330,3 +330,13 @@ async def test_a_very_long_flood_control_pause_is_not_waited_for(env, monkeypatc
     await adapter.handle_comment(m)
     assert m.delete.await_count == 1
     assert (await last_log(env.storage))["executed"] == 0, "recorded as not carried out"
+
+
+async def test_a_busy_ai_line_uses_the_local_filter_without_alarming_the_owner(env):
+    from core.jev_client import JevBusy
+
+    adapter, _ = env.build(JevBusy("too many waiting"))
+    spam = msg("Заработок без вложений, пиши в лс t.me/x_bot")
+    await adapter.handle_comment(spam)
+    spam.delete.assert_awaited_once()  # the local filter knows this kind of spam
+    assert not [c for c in sent_to(env.bot, OWNER) if "недоступен" in c.args[1]]

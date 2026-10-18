@@ -1,0 +1,7 @@
+[Unit]
+Description=DefenceAi: check that the newest backup can be restored
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/defenceai/deploy/verify-backup.sh

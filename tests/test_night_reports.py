@@ -15,7 +15,7 @@ DAY = datetime(2026, 9, 29, 9, 0, tzinfo=timezone.utc)  # 12:00 in Moscow
 
 
 class Jev:
-    async def ask(self, *args):
+    async def ask(self, *args, **kwargs):
         return BORDERLINE
 
 
