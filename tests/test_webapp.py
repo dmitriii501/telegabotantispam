@@ -259,10 +259,72 @@ async def test_bank_notification_route_needs_no_login_but_the_signature_decides(
 
 async def test_pay_button_asks_the_bot_to_write_the_plans(client):
     client.adapter.show_plans = AsyncMock(return_value=True)
-    r = await client.post(f"/api/chat/{CHAT}/pay", headers=h())
+    r = await client.post(f"/api/chat/{CHAT}/pay/chat", headers=h())
     assert r.status == 200 and (await r.json()) == {"sent": True}
     client.adapter.show_plans.assert_awaited_once_with(42, CHAT)
     client.adapter.show_plans = AsyncMock(return_value=False)  # the admin never pressed Start
-    assert (await (await client.post(f"/api/chat/{CHAT}/pay", headers=h())).json()) == {"sent": False}
-    assert (await client.post(f"/api/chat/{CHAT}/pay")).status == 401
-    assert (await client.post(f"/api/chat/{CHAT}/pay", headers=h({"id": 7, "first_name": "X"}))).status == 403
+    assert (await (await client.post(f"/api/chat/{CHAT}/pay/chat", headers=h())).json()) == {"sent": False}
+    assert (await client.post(f"/api/chat/{CHAT}/pay/chat")).status == 401
+    assert (await client.post(f"/api/chat/{CHAT}/pay/chat", headers=h({"id": 7, "first_name": "X"}))).status == 403
+
+
+# ----------------------------------------------------------- paying from the panel
+
+
+async def test_billing_payload_lists_plans_prices_and_ways_to_pay(client):
+    from core.billing import PLANS, price, price_rub
+
+    client.adapter.tbank = None
+    await client.storage.set_email(42, "me@mail.ru")
+    b = (await (await client.get(f"/api/chat/{CHAT}", headers=h())).json())["billing"]
+    assert b["rub_enabled"] is False and b["email"] == "me@mail.ru"
+    assert [t["months"] for t in b["terms"]] == [1, 3, 12] and b["terms"][2]["discount"] == 25
+    start = next(p for p in b["plans"] if p["key"] == "start")
+    assert start["prices"]["3"] == {"stars": price(PLANS["start"], 3), "rub": price_rub(PLANS["start"], 3)}
+    client.adapter.tbank = object()
+    assert (await (await client.get(f"/api/chat/{CHAT}", headers=h())).json())["billing"]["rub_enabled"] is True
+
+
+async def test_stars_payment_gives_a_link_for_the_payment_window(client):
+    client.adapter.create_stars_link = AsyncMock(return_value="https://t.me/$abc")
+    r = await client.post(f"/api/chat/{CHAT}/pay", json={"method": "stars", "plan": "pro", "months": 3}, headers=h())
+    assert r.status == 200 and await r.json() == {"kind": "invoice", "url": "https://t.me/$abc"}
+    client.adapter.create_stars_link.assert_awaited_once_with(CHAT, "pro", 3)
+
+
+async def test_rouble_payment_saves_the_email_and_gives_the_bank_page(client):
+    client.adapter.tbank = object()
+    client.adapter.make_rub_payment = AsyncMock(return_value="https://securepay/x")
+    body = {"method": "rub", "plan": "start", "months": 1, "email": " me@mail.ru "}
+    r = await client.post(f"/api/chat/{CHAT}/pay", json=body, headers=h())
+    assert r.status == 200 and await r.json() == {"kind": "link", "url": "https://securepay/x"}
+    client.adapter.make_rub_payment.assert_awaited_once_with(42, CHAT, "start", 1, "me@mail.ru")
+    assert await client.storage.get_email(42) == "me@mail.ru"
+
+
+async def test_the_pay_endpoint_rejects_bad_requests_and_strangers(client):
+    from core.tbank import TBankError
+
+    client.adapter.tbank = object()
+    client.adapter.make_rub_payment = AsyncMock()
+    ok = {"method": "rub", "plan": "start", "months": 1, "email": "me@mail.ru"}
+    for bad in ({**ok, "plan": "gold"}, {**ok, "months": 7}, {**ok, "months": True}, {**ok, "method": "cash"},
+                {**ok, "email": "nope"}, {**ok, "email": ""}):
+        assert (await client.post(f"/api/chat/{CHAT}/pay", json=bad, headers=h())).status == 400, bad
+    assert not client.adapter.make_rub_payment.await_count
+    assert (await client.post(f"/api/chat/{CHAT}/pay", json=ok)).status == 401
+    assert (await client.post(f"/api/chat/{CHAT}/pay", json=ok, headers=h({"id": 7, "first_name": "X"}))).status == 403
+    client.adapter.make_rub_payment = AsyncMock(side_effect=TBankError("терминал не найден"))
+    r = await client.post(f"/api/chat/{CHAT}/pay", json=ok, headers=h())
+    assert r.status == 502 and "терминал" in (await r.json())["error"]
+    client.adapter.tbank = None
+    assert (await client.post(f"/api/chat/{CHAT}/pay", json=ok, headers=h())).status == 400
+
+
+async def test_every_script_of_the_panel_is_served(client):
+    page = await (await client.get("/")).text()
+    scripts = [part.split('"')[0] for part in page.split('src="/static/')[1:]]
+    assert {"core.js", "shell.js", "home.js", "settings.js", "pay.js", "rules.js", "insights.js", "log.js", "app.js"} <= set(scripts)
+    for name in scripts:
+        r = await client.get(f"/static/{name}")
+        assert r.status == 200 and "javascript" in r.headers["Content-Type"], name

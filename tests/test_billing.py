@@ -317,3 +317,12 @@ async def test_plan_command_for_admins_in_a_group(env):
     stranger.reply = AsyncMock()
     await adapter.on_plan(stranger, CommandObject(prefix="/", command="plan"))
     stranger.reply.assert_not_awaited()
+
+
+async def test_one_invoice_description_serves_the_chat_and_the_panel(env):
+    adapter, _ = env.build()
+    env.bot.create_invoice_link = AsyncMock(return_value="https://t.me/$x")
+    assert await adapter.create_stars_link(CHAT, "pro", 3) == "https://t.me/$x"
+    kw = env.bot.create_invoice_link.await_args.kwargs
+    assert kw["currency"] == "XTR" and kw["payload"] == f"{CHAT}:pro:3" and kw["prices"][0].amount == price(PLANS["pro"], 3)
+    assert len(kw["title"]) <= 32

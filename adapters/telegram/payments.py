@@ -273,6 +273,22 @@ class PaymentsMixin:
             return None
         return (chat_id, plan, months) if plan in PLANS and months in TERMS else None
 
+    async def invoice_fields(self, chat_id: int, plan_key: str, months: int) -> dict:
+        """What Telegram needs for a Stars invoice: the same for the invoice in chat and the link of the panel."""
+        plan = PLANS[plan_key]
+        title = await self.chat_title(chat_id)
+        return dict(
+            title=f"DefenceAi «{plan.title}», {months} мес."[:32],
+            description=f"Модерация чата «{title}»: {months * PERIOD_DAYS} дней, до {number(plan.checks)} ИИ-проверок в месяц."[:255],
+            payload=f"{chat_id}:{plan_key}:{months}",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"{plan.title}, {months} мес.", amount=price(plan, months))],
+        )
+
+    async def create_stars_link(self, chat_id: int, plan_key: str, months: int) -> str:
+        """A link for the panel's `openInvoice`: the payment window opens inside the Mini App."""
+        return await self.bot.create_invoice_link(**await self.invoice_fields(chat_id, plan_key, months))
+
     async def on_buy_button(self, call: CallbackQuery) -> None:
         parsed = self.parse_payload(call.data.split(":", 1)[1])
         if not parsed:
@@ -282,17 +298,8 @@ class PaymentsMixin:
         if not await self.is_admin(chat_id, call.from_user.id, fresh=True):
             await call.answer("Оплатить может только админ этого чата.", show_alert=True)
             return
-        plan = PLANS[plan_key]
-        title = await self.chat_title(chat_id)
         try:
-            await self.bot.send_invoice(
-                chat_id=call.from_user.id,
-                title=f"DefenceAi «{plan.title}», {months} мес."[:32],
-                description=f"Модерация чата «{title}»: {months * PERIOD_DAYS} дней, до {number(plan.checks)} ИИ-проверок в месяц."[:255],
-                payload=f"{chat_id}:{plan_key}:{months}",
-                currency="XTR",
-                prices=[LabeledPrice(label=f"{plan.title}, {months} мес.", amount=price(plan, months))],
-            )
+            await self.bot.send_invoice(chat_id=call.from_user.id, **await self.invoice_fields(chat_id, plan_key, months))
         except TelegramAPIError as e:
             log.warning("Cannot send the invoice to %s: %s", call.from_user.id, e)
             await call.answer("Не получилось создать счёт. Попробуйте ещё раз.", show_alert=True)
@@ -409,27 +416,37 @@ class PaymentsMixin:
                 else "Адрес для чеков пока не задан: бот спросит его при первой оплате. Задать сразу: <code>/email name@mail.ru</code>"
             )
 
-    async def start_rub_payment(self, user_id: int, chat_id: int, plan_key: str, months: int, email: str) -> None:
+    async def make_rub_payment(self, user_id: int, chat_id: int, plan_key: str, months: int, email: str) -> str:
+        """Create the order and the bank's payment page. Returns the link; TBankError when the bank refuses."""
         plan = PLANS[plan_key]
         amount = price_rub(plan, months)
         order_id = secrets.token_hex(8)
         await self.storage.create_order(order_id, chat_id, user_id, plan_key, months, amount, email)
-        description = f"DefenceAi «{plan.title}», {months} мес."
         site = os.getenv("WEBAPP_URL", "").rstrip("/")
         try:
             payment_id, url = await self.tbank.create_payment(
                 order_id,
                 kopecks(amount),
-                description,
+                f"DefenceAi «{plan.title}», {months} мес.",
                 email,
                 notify_url=f"{site}/tbank/notify" if site else None,
                 success_url=f"https://t.me/{self.bot_username}" if self.bot_username else None,
             )
         except TBankError as e:
             log.error("T-Bank refused to create a payment: %s", e)
+            await self.storage.set_order(order_id, "failed")
+            raise
+        await self.storage.set_order(order_id, "sent", payment_id)
+        return url
+
+    async def start_rub_payment(self, user_id: int, chat_id: int, plan_key: str, months: int, email: str) -> None:
+        """The same in the bot's chat: the link comes as a message with a button."""
+        plan, amount = PLANS[plan_key], price_rub(PLANS[plan_key], months)
+        try:
+            url = await self.make_rub_payment(user_id, chat_id, plan_key, months, email)
+        except TBankError as e:
             await self.dm(user_id, f"Не получилось создать счёт: {html.escape(str(e))}. Попробуйте звёзды или напишите /paysupport.")
             return
-        await self.storage.set_order(order_id, "sent", payment_id)
         await self.dm(
             user_id,
             f"К оплате: <b>{amount:,} ₽</b> за тариф «{plan.title}», {months} мес.".replace(",", " ")

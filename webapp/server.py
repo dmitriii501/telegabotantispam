@@ -14,8 +14,11 @@ from pathlib import Path
 
 from aiohttp import web
 
-from core.billing import DAY, PERIOD_DAYS, PLANS, access
+from aiogram.exceptions import TelegramAPIError
+
+from core.billing import DAY, PERIOD_DAYS, PLANS, TERMS, access, price, price_rub
 from core.jev_client import JevError
+from core.tbank import EMAIL, TBankError
 from core.models import DELETING_ACTIONS, ActionType
 from core.links import MAX_ENTRIES, normalize_entry
 from core.moderation import MODES, ChatConfig
@@ -216,31 +219,68 @@ async def day_stats(storage, chat_id: int) -> dict:
     }
 
 
-async def billing_payload(adapter, chat) -> dict:
-    """Plan, time left and usage: the panel shows them in a card with a button to pay."""
+async def billing_payload(adapter, chat, user_id: int | None = None) -> dict:
+    """Plan, time left, usage and everything the pay screen needs: plans, prices per term, the ways to pay."""
     now = int(time.time())
     used = await adapter.storage.ai_checks(chat["chat_id"], now - PERIOD_DAYS * DAY)
     acc = access(chat, used, now)
     username = getattr(adapter, "bot_username", None)
     return {
         "state": acc.state,
+        "plan": acc.plan,
         "title": acc.title,
         "until": acc.until,
         "days_left": acc.days_left,
         "used": acc.used,
         "limit": acc.limit,
         "pay_url": f"https://t.me/{username}?start=pay_{chat['chat_id']}" if isinstance(username, str) and username else None,
-        "plans": [{"key": p.key, "title": p.title, "stars": p.stars} for p in PLANS.values()],
+        "rub_enabled": bool(getattr(adapter, "tbank", None)),
+        "email": (await adapter.storage.get_email(user_id)) if user_id else None,
+        "terms": [{"months": m, "discount": round((1 - k) * 100)} for m, k in TERMS.items()],
+        "plans": [
+            {
+                "key": p.key, "title": p.title, "stars": p.stars, "rub": p.rub, "checks": p.checks, "per_day": p.per_day,
+                "pitch": p.pitch, "prices": {str(m): {"stars": price(p, m), "rub": price_rub(p, m)} for m in TERMS},
+            }
+            for p in PLANS.values()
+        ],
     }
 
 
 async def open_payment(request: web.Request) -> web.Response:
-    """The panel's "choose a plan": the bot sends the plans to the admin's private chat.
-    `sent` is False when the bot cannot write to them yet (they never pressed Start): the panel then opens the link."""
+    """Fallback for old clients: the bot sends the plans to the admin's private chat.
+    `sent` is False when the bot cannot write to them yet (they never pressed Start)."""
     chat = await admin_chat(request, fresh=True)
     adapter = request.app["adapter"]
     sent = await adapter.show_plans(request["user"]["id"], chat["chat_id"])
     return web.json_response({"sent": bool(sent)})
+
+
+async def start_payment(request: web.Request) -> web.Response:
+    """Pay from inside the panel. Stars: a link for Telegram's own payment window. Roubles: the bank's page."""
+    chat = await admin_chat(request, fresh=True)
+    data = await read_json(request)
+    method, plan, months = data.get("method"), data.get("plan"), data.get("months")
+    if method not in ("stars", "rub") or plan not in PLANS or isinstance(months, bool) or months not in TERMS:
+        raise ApiError(400, "Некорректный выбор тарифа")
+    adapter = request.app["adapter"]
+    if method == "stars":
+        try:
+            url = await adapter.create_stars_link(chat["chat_id"], plan, months)
+        except TelegramAPIError:
+            raise ApiError(502, "Telegram не создал счёт. Попробуйте ещё раз.")
+        return web.json_response({"kind": "invoice", "url": url})
+    if not getattr(adapter, "tbank", None):
+        raise ApiError(400, "Оплата картой пока не подключена. Выберите звёзды.")
+    email = str(data.get("email") or "").strip()
+    if not EMAIL.match(email):
+        raise ApiError(400, "Укажите e-mail: на него придёт кассовый чек")
+    await adapter.storage.set_email(request["user"]["id"], email)
+    try:
+        url = await adapter.make_rub_payment(request["user"]["id"], chat["chat_id"], plan, months, email)
+    except TBankError as e:
+        raise ApiError(502, f"Банк не создал счёт: {e}")
+    return web.json_response({"kind": "link", "url": url})
 
 
 async def get_chat(request: web.Request) -> web.Response:
@@ -252,7 +292,7 @@ async def get_chat(request: web.Request) -> web.Response:
         {
             **chat_payload(chat, trusted),
             "stats": await day_stats(storage, chat["chat_id"]),
-            "billing": await billing_payload(adapter, chat),
+            "billing": await billing_payload(adapter, chat, request["user"]["id"]),
         }
     )
 
@@ -463,7 +503,8 @@ def create_app(adapter, bot_token: str) -> web.Application:
     app.router.add_put("/api/chat/{chat_id}/settings", put_settings)
     app.router.add_put("/api/chat/{chat_id}/links", put_links)
     app.router.add_post("/api/chat/{chat_id}/copy", copy_settings)
-    app.router.add_post("/api/chat/{chat_id}/pay", open_payment)
+    app.router.add_post("/api/chat/{chat_id}/pay", start_payment)
+    app.router.add_post("/api/chat/{chat_id}/pay/chat", open_payment)
     app.router.add_post("/api/chat/{chat_id}/parse", parse_text)
     app.router.add_get("/api/chat/{chat_id}/log", get_log)
     app.router.add_get("/api/chat/{chat_id}/insights", get_insights)
