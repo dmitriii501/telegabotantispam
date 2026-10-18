@@ -14,6 +14,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+from core.billing import DAY, PERIOD_DAYS, PLANS, access
 from core.jev_client import JevError
 from core.models import DELETING_ACTIONS, ActionType
 from core.links import MAX_ENTRIES, normalize_entry
@@ -205,11 +206,36 @@ async def day_stats(storage, chat_id: int) -> dict:
     }
 
 
+async def billing_payload(adapter, chat) -> dict:
+    """Plan, time left and usage: the panel shows them in a card with a button to pay."""
+    now = int(time.time())
+    used = await adapter.storage.ai_checks(chat["chat_id"], now - PERIOD_DAYS * DAY)
+    acc = access(chat, used, now)
+    username = getattr(adapter, "bot_username", None)
+    return {
+        "state": acc.state,
+        "title": acc.title,
+        "until": acc.until,
+        "days_left": acc.days_left,
+        "used": acc.used,
+        "limit": acc.limit,
+        "pay_url": f"https://t.me/{username}?start=pay_{chat['chat_id']}" if isinstance(username, str) and username else None,
+        "plans": [{"key": p.key, "title": p.title, "stars": p.stars} for p in PLANS.values()],
+    }
+
+
 async def get_chat(request: web.Request) -> web.Response:
     chat = await admin_chat(request)
-    storage = request.app["adapter"].storage
+    adapter = request.app["adapter"]
+    storage = adapter.storage
     trusted = await storage.list_trusted(chat["chat_id"])
-    return web.json_response({**chat_payload(chat, trusted), "stats": await day_stats(storage, chat["chat_id"])})
+    return web.json_response(
+        {
+            **chat_payload(chat, trusted),
+            "stats": await day_stats(storage, chat["chat_id"]),
+            "billing": await billing_payload(adapter, chat),
+        }
+    )
 
 
 async def put_rules(request: web.Request) -> web.Response:

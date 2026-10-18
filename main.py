@@ -27,6 +27,7 @@ async def main() -> None:
     adapter = TelegramAdapter(bot, Moderator(jev), storage)
     if not adapter.ocr.available:
         logging.getLogger(__name__).warning("Tesseract is not installed: text on pictures will not be read")
+    adapter.bot_username = (await bot.get_me()).username
     digest_task = asyncio.create_task(adapter.digest_loop())
     web_runner = None
     if adapter.webapp_url:
@@ -37,7 +38,7 @@ async def main() -> None:
     await adapter.set_commands()
     try:
         await adapter.dispatcher().start_polling(
-            bot, allowed_updates=["message", "edited_message", "callback_query", "my_chat_member"]
+            bot, allowed_updates=["message", "edited_message", "callback_query", "my_chat_member", "pre_checkout_query"]
         )
     finally:
         digest_task.cancel()

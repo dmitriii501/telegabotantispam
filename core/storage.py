@@ -6,6 +6,7 @@ import time
 import aiosqlite
 
 from core.avatar import similar
+from core.billing import TRIAL_DAYS, extend
 from core.normalizer import example_key
 
 SCHEMA = """
@@ -90,6 +91,16 @@ CREATE TABLE IF NOT EXISTS ocr_cache (
     text TEXT NOT NULL,
     ts INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS payments (
+    charge_id TEXT PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    payer_id INTEGER NOT NULL,
+    plan TEXT NOT NULL,
+    months INTEGER NOT NULL,
+    stars INTEGER NOT NULL,
+    refunded INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS reports (
     chat_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
@@ -135,6 +146,10 @@ CHAT_COLUMNS = [
     ("night_mode", "INTEGER NOT NULL DEFAULT 0"),
     ("night_from", "INTEGER NOT NULL DEFAULT 0"),
     ("night_to", "INTEGER NOT NULL DEFAULT 7"),
+    ("plan", "TEXT NOT NULL DEFAULT ''"),
+    ("paid_until", "INTEGER"),
+    ("trial_until", "INTEGER"),
+    ("billing_notice", "TEXT NOT NULL DEFAULT ''"),
 ]
 LOG_COLUMNS = [
     ("executed", "INTEGER NOT NULL DEFAULT 1"),
@@ -148,6 +163,7 @@ LOG_COLUMNS = [
 SETTINGS = (
     {name for name, _ in CHAT_COLUMNS}
     - {"rules_json", "pending_json", "digest_last", "allowed_domains", "blocked_domains", "lockdown_until"}
+    - {"plan", "paid_until", "trial_until", "billing_notice"}
     | {"enabled"}
 )
 
@@ -177,6 +193,10 @@ class Storage:
         await self._add_missing_columns("log", LOG_COLUMNS)
         await self._add_missing_columns("trusted", [("name", "TEXT NOT NULL DEFAULT ''")])
         await self._add_missing_columns("posts", [("ts", "INTEGER")])
+        # Chats that existed before the trial was introduced start their trial now.
+        await self.db.execute(
+            "UPDATE chats SET trial_until = ? WHERE trial_until IS NULL", (int(time.time()) + TRIAL_DAYS * DAY,)
+        )
         await self.db.commit()
 
     async def _add_missing_columns(self, table: str, columns: list[tuple[str, str]]) -> None:
@@ -198,7 +218,10 @@ class Storage:
 
     async def ensure_chat(self, chat_id: int) -> bool:
         """Create the chat row if missing; True when it was just created."""
-        cur = await self.db.execute("INSERT OR IGNORE INTO chats (chat_id) VALUES (?)", (chat_id,))
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO chats (chat_id, trial_until) VALUES (?, ?)",
+            (chat_id, int(time.time()) + TRIAL_DAYS * DAY),
+        )
         await self.db.commit()
         return cur.rowcount == 1
 
@@ -548,6 +571,79 @@ class Storage:
             (chat_id, since, min_score, min_score, limit),
         ) as cur:
             return await cur.fetchall()
+
+    # --- billing ---
+
+    async def chats_of_owner(self, user_id: int) -> list[aiosqlite.Row]:
+        async with self.db.execute("SELECT * FROM chats WHERE owner_id = ? ORDER BY chat_id", (user_id,)) as cur:
+            return await cur.fetchall()
+
+    async def ai_checks(self, chat_id: int, since: int) -> int:
+        """Comments of this chat that the AI really read since `since` (rows with token usage)."""
+        async with self.db.execute(
+            "SELECT COUNT(*) FROM log WHERE chat_id = ? AND ts >= ? AND tokens > 0", (chat_id, since)
+        ) as cur:
+            return (await cur.fetchone())[0]
+
+    async def record_payment(self, charge_id: str, chat_id: int, payer_id: int, plan: str, months: int, stars: int) -> bool:
+        """Save a payment and extend the chat's access. False when this charge was already processed
+        (Telegram may deliver the same notice twice)."""
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO payments (charge_id, ts, chat_id, payer_id, plan, months, stars) VALUES (?,?,?,?,?,?,?)",
+            (charge_id, int(time.time()), chat_id, payer_id, plan, months, stars),
+        )
+        if cur.rowcount != 1:
+            await self.db.commit()
+            return False
+        chat = await self.get_chat(chat_id)
+        await self.db.execute(
+            "UPDATE chats SET plan = ?, paid_until = ?, billing_notice = '' WHERE chat_id = ?",
+            (plan, extend(chat, plan, months), chat_id),
+        )
+        await self.db.commit()
+        return True
+
+    async def grant(self, chat_id: int, plan: str, days: int) -> int:
+        """The operator gives (or takes back, with negative days) access by hand. Returns the new end date."""
+        await self.ensure_chat(chat_id)
+        chat = await self.get_chat(chat_id)
+        now = int(time.time())
+        same = (chat["plan"] or "start") == plan
+        base = chat["paid_until"] if chat["paid_until"] and chat["paid_until"] > now and same else now
+        until = base + days * DAY
+        await self.db.execute(
+            "UPDATE chats SET plan = ?, paid_until = ?, billing_notice = '' WHERE chat_id = ?", (plan, until, chat_id)
+        )
+        await self.db.commit()
+        return until
+
+    async def get_payment(self, charge_id: str) -> aiosqlite.Row | None:
+        async with self.db.execute("SELECT * FROM payments WHERE charge_id = ?", (charge_id,)) as cur:
+            return await cur.fetchone()
+
+    async def mark_refunded(self, charge_id: str) -> None:
+        """A refunded payment takes its months back (never below today)."""
+        payment = await self.get_payment(charge_id)
+        if not payment or payment["refunded"]:
+            return
+        chat = await self.get_chat(payment["chat_id"])
+        now = int(time.time())
+        if chat and chat["paid_until"]:
+            until = max(now, chat["paid_until"] - payment["months"] * 30 * DAY)
+            await self.db.execute("UPDATE chats SET paid_until = ? WHERE chat_id = ?", (until, payment["chat_id"]))
+        await self.db.execute("UPDATE payments SET refunded = 1 WHERE charge_id = ?", (charge_id,))
+        await self.db.commit()
+
+    async def revenue(self, since: int = 0) -> dict:
+        async with self.db.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(stars), 0) AS stars FROM payments WHERE ts >= ? AND refunded = 0", (since,)
+        ) as cur:
+            row = await cur.fetchone()
+        return {"payments": row["n"], "stars": row["stars"]}
+
+    async def set_billing_notice(self, chat_id: int, key: str) -> None:
+        await self.db.execute("UPDATE chats SET billing_notice = ? WHERE chat_id = ?", (key, chat_id))
+        await self.db.commit()
 
     async def add_report(self, chat_id: int, message_id: int, reporter_id: int) -> int:
         """Record a member's complaint. Returns how many different people have complained about this message."""

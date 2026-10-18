@@ -96,6 +96,7 @@ const ICONS = {
   mute: '<path d="M11 5 6 9H2v6h4l5 4z"/><path d="m22 9-6 6M16 9l6 6"/>',
   copy: '<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>',
   chat: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/>',
+  card: '<rect x="2.5" y="5" width="19" height="14" rx="3"/><path d="M2.5 10h19M6.5 15h3"/>',
 };
 const icon = (name) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ""}</svg>`;
 const KIND_ICON = { prohibition: "x", permission: "check", context: "infoGlyph", everything: "ban" };
@@ -299,9 +300,19 @@ function renderApp(animate) {
   renderTab(animate);
 }
 
+// One quiet line under the status when the trial or the plan is about to end or has ended.
+function nudge(b) {
+  const text =
+    b.state === "expired"
+      ? "ИИ-проверка выключена: срок закончился"
+      : `${b.state === "trial" ? "Пробный период" : "Тариф"} закончится через ${b.days_left} ${dayWord(b.days_left)}`;
+  return `<button class="nudge ${b.state === "expired" ? "bad" : ""}" data-tab-go="settings">${esc(text)} ${icon("chevron")}</button>`;
+}
+
 function renderHead() {
   const s = state.data.settings;
   const st = state.data.stats;
+  const b = state.data.billing;
   const [tone, ico, title, sub] = statusInfo(s);
   const kpis = st
     ? `<div class="kpis"><div class="cap">За сутки</div>
@@ -315,11 +326,14 @@ function renderHead() {
       <div class="meta"><h1>${esc(chatTitle())}</h1>
         ${state.chats.length > 1 ? `<button class="switch-chat" id="switch">${icon("back")}Все чаты</button>` : '<div class="tag">Панель DefenceAi</div>'}</div></div>
     <div class="status ${tone}">${icon(ico)}<div class="txt"><b>${title}</b><small>${esc(sub)}</small></div></div>
+    ${b && (b.state === "expired" || b.state === "trial" && b.days_left <= 3 || b.state === "paid" && b.days_left <= 3) ? nudge(b) : ""}
     ${kpis}`;
   const sw = $("#switch");
   if (sw) sw.onclick = goBack;
   const pending = $("#kpiPending");
   if (pending) pending.onclick = () => switchTab("log");
+  const go = $("[data-tab-go]");
+  if (go) go.onclick = () => switchTab(go.dataset.tabGo);
   const logTab = $('#tabs button[data-t="log"]');
   if (logTab) {
     const old = logTab.querySelector(".badge");
@@ -610,6 +624,29 @@ function segmented(key, options) {
     .join("")}</div>`;
 }
 
+const num = (n) => Number(n).toLocaleString("ru-RU");
+const dayWord = (n) => (n % 100 >= 11 && n % 100 <= 14 ? "дней" : n % 10 === 1 ? "день" : n % 10 >= 2 && n % 10 <= 4 ? "дня" : "дней");
+
+// Plan and usage: a calm card at the top of the settings, with a way to pay.
+function billingCard() {
+  const b = state.data.billing;
+  if (!b) return "";
+  const date = new Date(b.until * 1000).toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
+  const pct = b.limit ? Math.min(100, Math.round((b.used / b.limit) * 100)) : 100;
+  const head =
+    b.state === "expired"
+      ? `<b>Срок закончился ${date}</b><small>ИИ-проверка выключена. Работают списки ссылок, антифлуд и защита от очевидного спама.</small>`
+      : `<b>${esc(b.title)}</b><small>${b.state === "trial" ? "бесплатно, " : "оплачен, "}осталось ${b.days_left} ${dayWord(b.days_left)} (до ${date})</small>`;
+  const usage =
+    b.state === "expired"
+      ? ""
+      : `<div class="usage"><div class="track"><i style="width:${pct}%" class="${pct >= 90 ? "hot" : ""}"></i></div>
+          <small>ИИ прочитал ${num(b.used)} из ${num(b.limit)} комментариев за 30 дней</small></div>`;
+  const label = b.state === "paid" ? "Продлить или сменить" : "Выбрать тариф";
+  const pay = b.pay_url ? `<button class="btn ${b.state === "paid" ? "ghost" : "primary"} wide" data-pay="${esc(b.pay_url)}">${icon("card")}${label}</button>` : "";
+  return `<div class="h">Тариф</div><div class="card plan ${b.state}">${head}${usage}${pay}</div>`;
+}
+
 function renderSettings() {
   const s = state.data.settings;
   const trusted = state.data.trusted
@@ -620,6 +657,7 @@ function renderSettings() {
     )
     .join("");
   $("#view").innerHTML = `
+    ${billingCard()}
     <div class="h">Режим работы</div>
     <div class="group">
       ${toggle("enabled", "power", "#34c759", "Модерация", "Выключите, чтобы бот временно ничего не проверял")}
@@ -675,6 +713,10 @@ function renderSettings() {
     if (t.dataset.seg) saveSetting(t.dataset.seg, t.dataset.v);
     if (t.dataset.linksMode) saveLinks({ mode: t.dataset.linksMode });
     if (t.id === "copyGo") copySettings();
+    if (t.dataset.pay) {
+      if (tg.openTelegramLink) tg.openTelegramLink(t.dataset.pay);
+      else window.open(t.dataset.pay, "_blank");
+    }
     if (t.dataset.untrust) untrust(Number(t.dataset.untrust));
   };
   view.onchange = (e) => {

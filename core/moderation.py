@@ -460,9 +460,11 @@ class Moderator:
         self.jev = jev
 
     async def check(
-        self, comment: Comment, config: ChatConfig, known: str | None = None, now: datetime | None = None
+        self, comment: Comment, config: ChatConfig, known: str | None = None, now: datetime | None = None, ai: bool = True
     ) -> Decision:
-        """`known` is what the admin (or the bot itself) already decided about this exact text."""
+        """`known` is what the admin (or the bot itself) already decided about this exact text.
+        With `ai=False` (the plan expired or its limit is used up) everything that runs in code still works:
+        lists, memory, avatars, antiflood, the local spam filter. Only the question to Jev is skipped."""
         if config.lockdown or config.blanket:
             return self._blanket(config)
         newcomer = config.profile_check and comment.author.previous_messages < NEWCOMER_MESSAGES
@@ -487,6 +489,10 @@ class Moderator:
         by_links = self._link_decision(comment, config, prohibitions, night)
         if by_links:
             return by_links
+        if not ai:
+            decision = self.fallback(comment, config, "спам (ИИ-проверка не оплачена)")
+            decision.extra["no_ai"] = True  # the AI would have read this comment: lets the bot tell the owner
+            return decision
         response = await self.jev.ask(
             build_state(comment, config.rules, config.allowed_domains),
             build_questions(prohibitions, config.analytics, profile=newcomer),
@@ -531,12 +537,12 @@ class Moderator:
         note = " (повторные нарушения)" if "повторные" in decision.reason else ""
         return replace(decision, reason=reason + note)
 
-    def fallback(self, comment: Comment, config: ChatConfig) -> Decision:
+    def fallback(self, comment: Comment, config: ChatConfig, reason: str = "спам (ИИ был недоступен)") -> Decision:
         """Local protection for the time Jev is down: only well-known spam, only with a lead-away."""
         if config.blanket or config.lockdown:
             return self._blanket(config)
         if looks_like_spam(comment.text, comment.links):
-            return _blanket_decision(Rule("", PROHIBITION, "delete"), "спам (ИИ был недоступен)")
+            return _blanket_decision(Rule("", PROHIBITION, "delete"), reason)
         return Decision(ActionType.NONE)
 
     @staticmethod

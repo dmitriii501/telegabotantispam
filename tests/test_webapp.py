@@ -228,3 +228,19 @@ async def test_health_needs_no_login_and_reports_a_stalled_bot(client):
     assert r.status == 200 and (await r.json())["ok"] is True
     client.adapter.heartbeat = time.time() - 600
     assert (await client.get("/health")).status == 503
+
+
+async def test_chat_payload_has_the_plan_and_a_payment_link(client):
+    b = (await (await client.get(f"/api/chat/{CHAT}", headers=h())).json())["billing"]
+    assert b["state"] == "trial" and b["pay_url"] is None and b["limit"] > 0 and b["days_left"] >= 1
+    client.adapter.bot_username = "DefenceAiBot"
+    await client.storage.record_payment("w1", CHAT, 42, "pro", 1, 990)
+    b = (await (await client.get(f"/api/chat/{CHAT}", headers=h())).json())["billing"]
+    assert b["state"] == "paid" and b["title"] == "Про" and b["pay_url"] == f"https://t.me/DefenceAiBot?start=pay_{CHAT}"
+    assert [p["key"] for p in b["plans"]] == ["start", "pro"]
+
+
+async def test_plan_columns_cannot_be_changed_through_settings(client):
+    for key in ("plan", "paid_until", "trial_until"):
+        r = await client.put(f"/api/chat/{CHAT}/settings", json={key: 1}, headers=h())
+        assert r.status == 400

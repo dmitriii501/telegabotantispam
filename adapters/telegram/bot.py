@@ -48,6 +48,8 @@ from core.normalizer import example_key
 from core.rules import CONTEXT, EVERYTHING, PERMISSION, Rule, rules_to_json
 from core.storage import DAY, Storage
 
+from adapters.telegram.payments import PaymentsMixin
+
 log = logging.getLogger(__name__)
 
 GROUPS = F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP})
@@ -175,6 +177,8 @@ PRIVACY_TEXT = (
 
 <b>Куда передаётся.</b> Для проверки текст комментария, текст поста, под которым он написан, имя автора и (у новичков) описание профиля отправляются в ИИ-сервис TypeSafe. Картинки никуда не отправляются: текст на них читается на нашем сервере. Другим третьим лицам данные не передаются и не продаются.
 
+<b>Оплата.</b> Платежи проходят через Telegram Stars. Мы храним только номер платежа, сумму, срок и номер плательщика; платёжных данных у нас нет.
+
 <b>Ваши права.</b> Если бот удалил ваш комментарий, нажмите «Оспорить» под уведомлением. Чтобы удалить ваши данные из журнала раньше срока, напишите администратору чата или владельцу сервиса.
 
 Бот не принимает решений вне чата и не делится репутацией участников между чатами, кроме отпечатков аватарок спам-ботов."""
@@ -208,6 +212,7 @@ HELP_TEXT = (
     "/links [ai|block|newcomers] — ссылки: /allowlink, /blocklink, /unlink адрес — списки сайтов и каналов\n"
     "/firststrict on|off — новички, написавшие в первые 2 минуты после поста (так боты занимают первое место), проверяются строже\n"
     "/spam — участники отвечают этой командой на плохой комментарий; после 3 жалоб бот спросит владельца\n"
+    "/plan — тариф, оставшийся срок и оплата\n"
     "/privacy — какие данные хранит бот\n"
     "/night on|off|0 7 — ночью (часы по Москве) проверка строже, а новичкам нельзя ссылки\n"
     "/antiraid on|off — предупреждать о массовых заходах; /cleanservice on|off — убирать «вошёл» и «вышел»\n"
@@ -319,7 +324,7 @@ def on_off(value: bool) -> str:
     return "включено" if value else "выключено"
 
 
-class TelegramAdapter:
+class TelegramAdapter(PaymentsMixin):
     def __init__(self, bot: Bot, moderator: Moderator, storage: Storage, ocr: OcrEngine | None = None):
         self.ocr = ocr if ocr is not None else OcrEngine()
         self.bot = bot
@@ -339,6 +344,7 @@ class TelegramAdapter:
         self._raid_alerted: dict[int, float] = {}
         self._captcha: dict[tuple[int, int], dict] = {}  # open checks: (chat, user) -> answer, messages
         self._purged_day = ""
+        self._init_payments()
         self.heartbeat = time.time()  # refreshed by the daily-job loop every minute; /health reads it
         self.webapp_url = os.getenv("WEBAPP_URL", "").rstrip("/")
         self.router = Router()
@@ -490,7 +496,7 @@ class TelegramAdapter:
         task.add_done_callback(self._tasks.discard)
         return task
 
-    async def notify_owner(self, chat, key: str, text: str, cooldown: float) -> None:
+    async def notify_owner(self, chat, key: str, text: str, cooldown: float, markup=None) -> None:
         """Message the chat owner, but not more often than once per `cooldown` for the same `key`."""
         owner_id = chat["owner_id"] if chat else None
         if not owner_id:
@@ -500,7 +506,7 @@ class TelegramAdapter:
         if now - self._notified.get(ck, 0) < cooldown:
             return
         self._notified[ck] = now
-        await self.dm(owner_id, f"{text}\n\nЧат: «{html.escape(await self.chat_title(chat['chat_id']))}»")
+        await self.dm(owner_id, f"{text}\n\nЧат: «{html.escape(await self.chat_title(chat['chat_id']))}»", markup)
 
     async def linked_channel(self, chat_id: int) -> int | None:
         """The channel this discussion group belongs to (its own comments are never moderated)."""
@@ -569,6 +575,7 @@ class TelegramAdapter:
     def _register(self) -> None:
         r = self.router
         r.message(CommandStart(), F.chat.type == ChatType.PRIVATE)(self.on_start)
+        self._register_payments(r)
         r.message(Command("privacy"))(self.on_privacy)
         r.my_chat_member()(self.on_bot_added)
         r.message(Command("rules"), GROUPS)(self.on_rules)
@@ -610,7 +617,10 @@ class TelegramAdapter:
         r.message(GROUPS)(self.on_group_message)
         r.edited_message(GROUPS)(self.on_edited_message)
 
-    async def on_start(self, message: Message) -> None:
+    async def on_start(self, message: Message, command: CommandObject | None = None) -> None:
+        arg = (command.args or "") if command else ""
+        if arg.startswith("pay_") and await self.start_payment(message, arg[4:]):
+            return
         await message.answer(HELP_TEXT, reply_markup=self.panel_markup())
 
     async def on_privacy(self, message: Message) -> None:
@@ -667,7 +677,7 @@ class TelegramAdapter:
             text = "Привет! Мне не хватает прав: " + ", ".join(missing) + ". Включите их в настройках админа."
         elif created:
             text = (
-                "Готов к работе. Первые дни я в <b>пробном режиме</b>: ничего не удаляю, а записываю, "
+                "Готов к работе. Первые 14 дней бесплатно, и в первые дни я в <b>пробном режиме</b>: ничего не удаляю, а записываю, "
                 "что сделал бы. Через несколько дней <code>/report</code> покажет результат, "
                 "<code>/observe off</code> включит настоящую модерацию.\n"
                 "Проверить меня можно сразу: напишите в чат тестовое рекламное сообщение, и я отвечу, "
@@ -1243,8 +1253,12 @@ class TelegramAdapter:
         ):
             decision = self.moderator.flood_decision(config.flood_mute_minutes)
         else:
+            acc = await self.access_for(chat) if chat else None
+            ai = acc is None or acc.ai_allowed
             try:
-                decision = await self.moderator.check(comment, config, known)
+                decision = await self.moderator.check(comment, config, known, ai=ai)
+                if decision.extra.get("no_ai"):
+                    await self.billing_alert(chat, acc)
             except JevError as e:
                 log.error("Jev unavailable, using the local fallback filter: %s", e)
                 await self.notify_owner(
@@ -1285,6 +1299,7 @@ class TelegramAdapter:
             sentiment=v.sentiment,
             violation=v.violation_probability,
         )
+        self.note_usage(chat_id, v.input_tokens)
         log.info("chat=%s author=%s action=%s edited=%s %s", chat_id, author_id, decision.action.value, edited, v)
         if config.observe:
             await self.storage.set_executed(log_id, False)  # a dry run: recorded, not carried out
@@ -1845,6 +1860,7 @@ class TelegramAdapter:
             if now.hour == DIGEST_HOUR_UTC:
                 try:
                     await self.send_digests(now)
+                    await self.send_billing_notices()
                     await self.purge_expired(now.strftime("%Y-%m-%d"))
                 except Exception:
                     log.exception("Daily job failed")

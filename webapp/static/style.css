@@ -244,6 +244,18 @@ textarea.paste:focus{box-shadow:0 0 0 1.5px var(--accent-soft)}
 .entry .acts{display:flex;gap:8px;margin-top:12px}
 .entry .acts .btn{flex:1;padding:9px;font-size:14px}
 
+.plan{display:flex;flex-direction:column;gap:10px}
+.plan b{display:block;font-family:var(--serif);font-size:19px;font-weight:500}
+.plan small{display:block;color:var(--hint);font-size:13px;margin-top:2px}
+.plan.expired b{color:var(--bad)}
+.usage .track{height:6px;border-radius:3px;background:var(--chip-strong);overflow:hidden}
+.usage .track i{display:block;height:100%;background:var(--accent);border-radius:3px;opacity:.85}
+.usage .track i.hot{background:var(--warn)}
+.usage small{margin-top:6px}
+.nudge{display:flex;align-items:center;gap:4px;margin-top:12px;border:0;background:var(--warn-soft);color:var(--warn);padding:7px 12px;border-radius:999px;font-size:13px;cursor:pointer}
+.nudge.bad{background:var(--bad-soft);color:var(--bad)}
+.nudge svg.i{width:14px;height:14px}
+
 /* chat picker */
 .chat-item{display:flex;align-items:center;gap:14px;width:100%;border:0;background:none;text-align:left;padding:12px 16px;cursor:pointer;position:relative}
 .chat-item + .chat-item:before{content:"";position:absolute;top:0;right:16px;left:76px;border-top:1px solid var(--line)}
