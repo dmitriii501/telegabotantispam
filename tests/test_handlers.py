@@ -41,6 +41,8 @@ class ScriptedJev:
         self.responses = list(responses) or [answer()]
         self.calls = []
 
+    vision = False
+
     async def ask(self, state, questions, key=None):
         self.calls.append((state, questions))
         item = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]

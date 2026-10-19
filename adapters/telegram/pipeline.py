@@ -29,6 +29,7 @@ from adapters.telegram.common import (
     FLOOD_LIMITS,
     FLOOD_MESSAGES,
     FLOOD_WINDOW,
+    IMAGE_TIMEOUT,
     JEV_ALERT_COOLDOWN,
     OCR_TIMEOUT,
     PROFILE_TIMEOUT,
@@ -47,6 +48,8 @@ from adapters.telegram.common import (
     user_of,
 )
 from adapters.telegram.settings import SettingsMixin
+from core.images import image_key
+from core.images import prepare as prepare_image
 from core.jev_client import JevBusy, JevError
 from core.metrics import COMMENT_SECONDS, COMMENTS, TELEGRAM_ERRORS
 from core.models import DELETING_ACTIONS, ActionType, Author, Comment, Decision, Verdict
@@ -85,6 +88,7 @@ class Prepared:
     known: str | None  # what was decided about this exact text before
     previous: int  # messages of the author in this chat so far
     image_text: str | None
+    image: bytes | None = None  # the picture, ready to be shown to the AI
 
 
 class PipelineMixin(SettingsMixin):
@@ -106,6 +110,18 @@ class PipelineMixin(SettingsMixin):
             thumb = message.animation.thumbnail
             return thumb.file_id, thumb.file_unique_id
         return None
+
+    async def load_image(self, message: Message) -> bytes | None:
+        """The message's picture in the form the AI accepts (None: no picture, or it cannot be read)."""
+        source = self.image_source(message)
+        if not source:
+            return None
+        try:
+            data = await asyncio.wait_for(download_bytes(self.bot, source[0]), IMAGE_TIMEOUT)
+        except Exception as e:  # a picture we cannot fetch is judged by its text alone
+            log.info("image: cannot download %s: %s", source[1], e)
+            return None
+        return prepare_image(data) if data else None
 
     async def read_image_text(self, message: Message) -> str | None:
         """Text found on the message's picture. Every picture is read once: the result is remembered by file."""
@@ -265,10 +281,13 @@ class PipelineMixin(SettingsMixin):
         previous = await self.storage.message_count(chat_id, who.author_id)
         newcomer = previous < NEWCOMER_MESSAGES
         plain = not config.lockdown and not config.blanket
-        image_text = None
-        if config.image_ocr and self.ocr.available and not who.is_channel and not who.edited and newcomer and plain:
-            image_text = await self.read_image_text(message)
-        key = example_key(who.text or image_text or "")
+        image_text, image = None, None
+        if config.image_ocr and not who.is_channel and not who.edited and newcomer and plain:
+            if self.moderator.jev.vision:
+                image = await self.load_image(message)
+            if image is None and self.ocr.available:  # pictures off, refused for now, or unreadable: the local reader
+                image_text = await self.read_image_text(message)
+        key = example_key(who.text or image_text or "") or (image_key(image) if image else None)
         known = await self.storage.example_kind(chat_id, key) if key else None
         post_text, reply_to_text = await self.comment_context(message) if plain else (None, None)
         profile = None
@@ -295,8 +314,9 @@ class PipelineMixin(SettingsMixin):
             links=self.extract_links(message),
             seconds_after_post=await self.seconds_after_post(message) if config.first_strict and not who.edited else None,
             image_text=image_text,
+            image=image,
         )
-        return Prepared(comment, key, known, previous, image_text)
+        return Prepared(comment, key, known, previous, image_text, image)
 
     async def _decide(self, who: "Incoming", prepared: "Prepared", config: ChatConfig) -> Decision:
         """Antiflood first (it costs nothing), then the moderator; the local filter when the AI is down."""
@@ -335,6 +355,8 @@ class PipelineMixin(SettingsMixin):
                 self.spawn(self.watch_thread(message, who.text, config, who.chat))
         if prepared.image_text:
             decision.extra["image_text"] = prepared.image_text
+        if prepared.image:
+            decision.extra["image"] = True
         verdict = decision.verdict
         if verdict is None:  # nothing to record: skipped without asking Jev
             await self._challenge_if_due(who, prepared, config, decision, observe_blocks=True)
@@ -346,7 +368,9 @@ class PipelineMixin(SettingsMixin):
             if decision.action in DELETING_ACTIONS:
                 await self.trial_notice(message, decision, log_id, who.chat, who.author_name)
             return
-        if prepared.key and decision.action == ActionType.DELETE_AND_BAN and verdict.confidence >= AUTO_REMEMBER_CONFIDENCE:
+        # A picture is never banned for, but a sure spam picture is recognised next time without asking the AI again.
+        sure_spam_picture = bool(prepared.image) and decision.action == ActionType.DELETE_SILENT and verdict.category.value == "spam"
+        if prepared.key and (decision.action == ActionType.DELETE_AND_BAN or sure_spam_picture) and verdict.confidence >= AUTO_REMEMBER_CONFIDENCE:
             await self.storage.add_example(chat_id, prepared.key, "remove")
         if not await self.execute(message, decision, log_id, who.chat):
             await self.storage.set_executed(log_id, False)

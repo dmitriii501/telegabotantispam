@@ -5,6 +5,7 @@ Everything here is platform-independent. Adapters build a `Comment`, call
 """
 
 import json
+import logging
 import sqlite3
 import time
 from collections.abc import Mapping
@@ -13,8 +14,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.fallback import looks_like_spam
-from core.jev_client import JevClient
+from core.jev_client import JevClient, JevRejected
 from core.links import any_match, extract_links, outside
+from core.metrics import JEV_IMAGE_TOKENS, JEV_IMAGES
 from core.models import ActionType, Category, Comment, Decision, Verdict
 from core.normalizer import normalize
 from core.rules import (
@@ -28,6 +30,8 @@ from core.rules import (
     rules_from_text,
     split_rules,
 )
+
+log = logging.getLogger(__name__)
 
 CATEGORY_CRITERIA = {
     Category.SPAM.value: (
@@ -65,6 +69,7 @@ BAN_AT = 5
 MUTE_HOURS = 24
 
 CONTEXT_LIMIT = 600
+IMAGE_REF = "6f1c2f0e-3b7a-4d58-9a41-0c5e8d7b2a13"  # what `picture` in the state points to; the same in every request
 
 
 @dataclass(frozen=True)  # shared as a default argument, so it must not be changeable
@@ -244,10 +249,15 @@ def build_state(comment: Comment, rules: list[Rule], allowed_domains: list[str] 
         if profile:
             author["profile"] = profile
     shown = comment.text
-    if comment.image_text:
+    if comment.image:
+        note = "[К сообщению приложена картинка или стикер, она в поле `picture`. Оцени и её]"
+        shown = f"{comment.text}\n{note}" if comment.text else note
+    elif comment.image_text:
         note = f"[Картинка или стикер. Текст на ней распознан неточно, с ошибками]: {comment.image_text}"
         shown = f"{comment.text}\n{note}" if comment.text else note
     state: dict[str, Any] = {"rules": texts, "comment": shown, "author": author}
+    if comment.image:
+        state["picture"] = IMAGE_REF
     if normalized != comment.text:
         state["comment_with_letters_restored"] = normalized
     if comment.links:
@@ -261,6 +271,10 @@ def build_state(comment: Comment, rules: list[Rule], allowed_domains: list[str] 
     return state
 
 
+PICTURE_HINT = (
+    " Картинка `picture` — часть комментария: надпись на ней, реклама, контакты, QR-код, "
+    "скриншот выигрыша или заработка считаются так же, как текст."
+)
 KIND_CRITERIA = {
     "question": "Спрашивает о чём-то по делу и ждёт ответа",
     "complaint": "Жалуется, выражает недовольство или претензию",
@@ -303,23 +317,24 @@ ANALYTICS_QUESTIONS = {
 }
 
 
-def build_questions(prohibitions: list[Rule], analytics: bool = False, profile: bool = False) -> dict:
+def build_questions(prohibitions: list[Rule], analytics: bool = False, profile: bool = False, picture: bool = False) -> dict:
     rule_options = {f"r{i}": rule.text for i, rule in enumerate(prohibitions)}
     rule_options["none"] = "Комментарий не нарушает ни одно правило"
     questions: dict[str, Any] = {
         "category": {
             "type": "choice",
-            "instructions": "К какой категории относится `comment` с учётом `rules`?",
+            "instructions": "К какой категории относится `comment` с учётом `rules`?" + (PICTURE_HINT if picture else ""),
             "criteria": CATEGORY_CRITERIA,
         },
         "rule": {
             "type": "choice",
-            "instructions": "Какое правило из `rules` нарушает `comment`?",
+            "instructions": "Какое правило из `rules` нарушает `comment`?" + (" Картинка `picture` — часть комментария." if picture else ""),
             "criteria": rule_options,
         },
         "is_bot": {
             "type": "noul",
-            "instructions": "`comment` написан спам-ботом или спамером, а не обычным подписчиком?",
+            "instructions": "`comment` написан спам-ботом или спамером, а не обычным подписчиком?"
+            + (" Картинка `picture` — часть комментария." if picture else ""),
             "criteria": {
                 "true": "Спам-бот, рекламщик или мошенник",
                 "false": "Живой подписчик, даже если он грубит или нарушает правила",
@@ -481,7 +496,7 @@ class Moderator:
         thresholds = MODES["strict"] if rushed or night else config.thresholds
         if newcomer and comment.author.profile and comment.author.profile.avatar_match:
             return avatar_decision(thresholds)
-        if not needs_check(comment.text + (comment.image_text or ""), comment.links):
+        if not comment.image and not needs_check(comment.text + (comment.image_text or ""), comment.links):
             return Decision(ActionType.NONE)
         if known == "allow":
             return Decision(ActionType.NONE, None, "админ уже разрешил такой комментарий")
@@ -495,11 +510,9 @@ class Moderator:
             decision = self.fallback(comment, config, "спам (ИИ-проверка не оплачена)")
             decision.extra["no_ai"] = True  # the AI would have read this comment: lets the bot tell the owner
             return decision
-        response = await self.jev.ask(
-            build_state(comment, config.rules, config.allowed_domains),
-            build_questions(prohibitions, config.analytics, profile=newcomer),
-            key=comment.chat_id,
-        )
+        response = await self._ask_jev(comment, config, prohibitions, newcomer)
+        if response is None:  # a picture the API refused and nothing else worth judging
+            return Decision(ActionType.NONE)
         return decide(
             parse_verdict(response),
             prohibitions,
@@ -507,7 +520,34 @@ class Moderator:
             config.escalation,
             comment.author.previous_deletions,
             newcomer=newcomer,
-            image_evidence=bool(comment.image_text),
+            image_evidence=bool(comment.image_text or comment.image),
+        )
+
+    async def _ask_jev(self, comment: Comment, config: ChatConfig, prohibitions: list[Rule], newcomer: bool) -> dict | None:
+        """Ask Jev about the comment. If the API refuses its picture, the text alone is judged instead;
+        None when the refused picture was all there was."""
+        if comment.image:
+            try:
+                response = await self.jev.ask(
+                    build_state(comment, config.rules, config.allowed_domains),
+                    build_questions(prohibitions, config.analytics, profile=newcomer, picture=True),
+                    key=comment.chat_id,
+                    images={IMAGE_REF: comment.image},
+                )
+            except JevRejected as e:
+                JEV_IMAGES.inc(outcome="rejected")
+                log.warning("Jev refused a picture, judging the text only: %s", e)
+                comment = replace(comment, image=None)
+                if not needs_check(comment.text + (comment.image_text or ""), comment.links):
+                    return None
+            else:
+                JEV_IMAGES.inc(outcome="judged")
+                JEV_IMAGE_TOKENS.inc(int(response.get("usage", {}).get("input_tokens", 0)))
+                return response
+        return await self.jev.ask(
+            build_state(comment, config.rules, config.allowed_domains),
+            build_questions(prohibitions, config.analytics, profile=newcomer),
+            key=comment.chat_id,
         )
 
     def _link_decision(

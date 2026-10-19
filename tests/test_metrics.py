@@ -97,7 +97,7 @@ async def test_the_ai_client_reports_outcomes_and_queue():
 
     client = JevClient("k")
 
-    async def fine(state, questions):
+    async def fine(state, questions, images=None):
         return {"answers": {}, "usage": {}}
 
     before = total(JEV_REQUESTS, outcome="ok")

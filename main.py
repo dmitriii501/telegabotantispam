@@ -10,6 +10,7 @@ from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 
 from adapters.telegram.bot import TelegramAdapter
+from core.images import vision_enabled
 from core.jev_client import JevClient
 from core.moderation import Moderator
 from core.storage import Storage
@@ -22,7 +23,7 @@ async def main() -> None:
 
     storage = Storage(os.getenv("DB_PATH", "bot.db"))
     await storage.open()
-    jev = JevClient(os.environ["TYPESAFE_API_KEY"], model=os.getenv("JEV_MODEL", "jev-latest"))
+    jev = JevClient(os.environ["TYPESAFE_API_KEY"], model=os.getenv("JEV_MODEL", "jev-latest"), vision=vision_enabled())
     bot = Bot(os.environ["TELEGRAM_BOT_TOKEN"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     adapter = TelegramAdapter(bot, Moderator(jev), storage)
     from webapp.legal import missing_details
@@ -31,8 +32,8 @@ async def main() -> None:
         logging.getLogger(__name__).warning(
             "The offer and privacy pages show empty seller details, fill in %s in .env before the first sale", ", ".join(missing_details())
         )
-    if not adapter.ocr.available:
-        logging.getLogger(__name__).warning("Tesseract is not installed: text on pictures will not be read")
+    if not jev.vision and not adapter.ocr.available:
+        logging.getLogger(__name__).warning("Pictures are off and Tesseract is not installed: pictures will not be checked")
     adapter.bot_username = (await bot.get_me()).username
     digest_task = asyncio.create_task(adapter.digest_loop())
     web_runner = None

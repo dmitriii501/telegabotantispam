@@ -41,6 +41,8 @@ class Comment:
     seconds_after_post: int | None = None
     # Text read from a picture or sticker: noisy, so it is a hint and never grounds for an automatic ban.
     image_text: str | None = None
+    # The picture itself, already brought into the size the AI accepts (see core/images.py).
+    image: bytes | None = field(default=None, repr=False, compare=False)
 
 
 class Category(str, Enum):

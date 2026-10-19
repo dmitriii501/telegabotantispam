@@ -17,6 +17,7 @@ from aiogram.types import (
     User,
 )
 
+from core.images import privacy_wording
 from core.models import ActionType, Decision
 from core.moderation import (
     ChatConfig,
@@ -53,6 +54,7 @@ SERVICE_KINDS = {
     "forum_topic_closed", "forum_topic_reopened", "migrate_to_chat_id", "migrate_from_chat_id",
 }
 CLEANABLE_SERVICE = SERVICE_KINDS - {"migrate_to_chat_id", "migrate_from_chat_id", "forum_topic_created"}
+IMAGE_TIMEOUT = 8.0  # seconds a newcomer's picture may take to download
 OCR_TIMEOUT = 15.0  # seconds a newcomer's picture may wait for its text
 PROFILE_TTL = 3 * 24 * 3600  # how long a fetched profile is reused
 PROFILE_TIMEOUT = 4.0  # seconds a newcomer's first message may wait for the profile lookup
@@ -137,6 +139,7 @@ RIGHTS_TEXT = (
 REPORT_THRESHOLD = 3  # different members complaining about one comment before the owner is asked
 
 
+_PICTURES_KEPT, _PICTURES_SENT = privacy_wording()
 PRIVACY_TEXT = (
     """<b>Какие данные обрабатывает DefenceAi</b>
 
@@ -145,17 +148,17 @@ PRIVACY_TEXT = (
 <b>Что сохраняется.</b>
 • Текст комментария, имя и номер автора, решение бота и причина: в журнале {days} дней, потом удаляется автоматически.
 • Отпечаток аватарки (короткий хеш, не картинка) и описание профиля новичка: до {days} дней; отпечатки аватарок забаненных спам-ботов хранятся в общей базе без имён и текстов.
-• Текст, прочитанный с картинок и стикеров новичков: до {days} дней.
+• {pictures_kept} Срок: до {days} дней.
 • Правила и настройки чата: пока бот в чате.
 
-<b>Куда передаётся.</b> Для проверки текст комментария, текст поста, под которым он написан, имя автора и (у новичков) описание профиля отправляются в ИИ-сервис TypeSafe. Картинки никуда не отправляются: текст на них читается на нашем сервере. Другим третьим лицам данные не передаются и не продаются.
+<b>Куда передаётся.</b> Для проверки текст комментария, текст поста, под которым он написан, имя автора и (у новичков) описание профиля отправляются в ИИ-сервис TypeSafe. {pictures_sent} Другим третьим лицам данные не передаются и не продаются.
 
 <b>Оплата.</b> Платежи проходят через Telegram Stars. Мы храним номер платежа, сумму, срок и номер плательщика, а при оплате картой ещё e-mail для кассового чека; номеров карт у нас нет (платёж принимает банк).
 
 <b>Ваши права.</b> Если бот удалил ваш комментарий, нажмите «Оспорить» под уведомлением. Чтобы удалить ваши данные из журнала раньше срока, напишите администратору чата или владельцу сервиса.
 
 Бот не принимает решений вне чата и не делится репутацией участников между чатами, кроме отпечатков аватарок спам-ботов."""
-).replace("{days}", str(RETENTION_DAYS))
+).replace("{days}", str(RETENTION_DAYS)).replace("{pictures_kept}", _PICTURES_KEPT).replace("{pictures_sent}", _PICTURES_SENT)
 
 
 HELP_TEXT = (
@@ -189,7 +192,7 @@ HELP_TEXT = (
     "/privacy — какие данные хранит бот, /offer — оферта\n"
     "/night on|off|0 7 — ночью (часы по Москве) проверка строже, а новичкам нельзя ссылки\n"
     "/antiraid on|off — предупреждать о массовых заходах; /cleanservice on|off — убирать «вошёл» и «вышел»\n"
-    "/ocr on|off — читать текст на картинках и стикерах новичков (рекламу в виде картинки)\n"
+    "/ocr on|off — смотреть картинки и стикеры новичков (реклама в виде картинки)\n"
     "/captcha on|off — новичок после первого сообщения нажимает нужную кнопку, иначе сообщение удаляется и мут на сутки\n"
     "/profilecheck on|off — проверять профиль новичков; /profile ответом на сообщение покажет, что бот видит\n"
     "/lockdown on|off — удалять всё от участников (на время рейда)\n"

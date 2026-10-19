@@ -56,6 +56,8 @@ class NoJev:
     def __init__(self):
         self.calls = 0
 
+    vision = False
+
     async def ask(self, *args, **kwargs):
         self.calls += 1
         return answer()

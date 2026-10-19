@@ -86,13 +86,21 @@ class AdapterBase:
         await self.storage.claim_owner(message.chat.id, user_of(message).id)
         return True
 
+    @property
+    def sees_images(self) -> bool:
+        """Pictures can be judged: by the AI, or by the local text reader."""
+        return self.moderator.jev.vision or self.ocr.available
+
     @staticmethod
     def shown_text(message: Message, decision: Decision) -> str | None:
         text = message.text or message.caption
         image_text = decision.extra.get("image_text")
-        if text or not image_text:
+        if text:
             return text
-        return f"{media_label(message) or '[картинка]'} с надписью: {image_text[:400]}"
+        label = media_label(message) or "[картинка]"
+        if image_text:
+            return f"{label} с надписью: {image_text[:400]}"
+        return f"{label} (ИИ смотрел картинку)" if decision.extra.get("image") else None
 
     def trial_slot(self, chat_id: int, kind: str, limit: int) -> int | None:
         """Use one of today's `limit` trial-mode messages; returns how many are left, None when none were."""

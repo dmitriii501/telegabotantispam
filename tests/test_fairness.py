@@ -122,7 +122,7 @@ async def test_a_raid_in_one_chat_does_not_delay_the_others_at_the_client():
     done: list[int] = []
     gate = asyncio.Event()
 
-    async def slow_ask(state, questions):
+    async def slow_ask(state, questions, images=None):
         await gate.wait()
         return {"answers": {}, "usage": {}}
 
@@ -144,7 +144,7 @@ async def test_a_too_long_line_is_a_busy_signal_not_an_outage():
     client.limiter.max_queue = 2
     gate = asyncio.Event()
 
-    async def slow_ask(state, questions):
+    async def slow_ask(state, questions, images=None):
         await gate.wait()
         return {"answers": {}, "usage": {}}
 

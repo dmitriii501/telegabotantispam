@@ -114,7 +114,7 @@ class SettingsMixin(ReportsMixin):
             f"Строгая проверка первых комментариев под постом: {on_off(config.first_strict)}\n"
             f"Ночной режим: {describe_night(config)}\n"
             f"Проверка «я человек» для новичков: {on_off(config.captcha)}\n"
-            f"Чтение текста на картинках новичков: {on_off(config.image_ocr and self.ocr.available)}\n"
+            f"Проверка картинок и стикеров новичков: {on_off(config.image_ocr and self.sees_images)}\n"
             f"Пробный режим (ничего не удаляю): {on_off(config.observe)}\n\n"
             f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам и мошенничество — всегда запрещены"
         )
@@ -276,7 +276,7 @@ class SettingsMixin(ReportsMixin):
         await self._switch(message, command, "clean_service", "Удаление служебных сообщений")
 
     async def on_ocr(self, message: Message, command: CommandObject) -> None:
-        await self._switch(message, command, "image_ocr", "Чтение текста на картинках новичков")
+        await self._switch(message, command, "image_ocr", "Проверка картинок и стикеров новичков")
 
     async def on_firststrict(self, message: Message, command: CommandObject) -> None:
         await self._switch(message, command, "first_strict", "Строгая проверка первых комментариев")

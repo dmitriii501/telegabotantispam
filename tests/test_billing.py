@@ -128,6 +128,8 @@ class CountingJev:
     def __init__(self):
         self.calls = 0
 
+    vision = False
+
     async def ask(self, *a):
         self.calls += 1
         return SPAM
