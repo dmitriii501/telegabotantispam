@@ -7,7 +7,7 @@ from aiogram.enums import ChatMemberStatus
 from aiogram.filters import CommandObject
 
 from adapters.telegram import common as botmod
-from tests.test_handlers import CHAT, OWNER, SPAM, answer, msg, sent_to
+from tests.test_handlers import CHAT, OWNER, SPAM, answer, joined_event, msg, sent_to
 from tests.test_webapp import CHAT as WEB_CHAT  # noqa: F401
 from tests.test_webapp import h
 
@@ -82,7 +82,7 @@ async def test_command_menu_is_registered_for_private_chats_and_admins(env):
     await adapter.set_commands()
     assert env.bot.set_my_commands.await_count == 2
     scopes = {type(c.kwargs["scope"]).__name__: [x.command for x in c.args[0]] for c in env.bot.set_my_commands.await_args_list}
-    assert scopes["BotCommandScopeAllPrivateChats"] == ["start", "panel"]
+    assert scopes["BotCommandScopeAllPrivateChats"] == ["start", "ref", "panel"]
     assert "rules" in scopes["BotCommandScopeAllChatAdministrators"] and "help" in scopes["BotCommandScopeAllChatAdministrators"]
 
 
@@ -101,10 +101,7 @@ async def test_not_admin_bot_is_told_exactly_what_to_enable(env):
     adapter, _ = env.build()
     env.bot.id = 1
     env.bot.get_chat_member = AsyncMock(return_value=MagicMock(status=ChatMemberStatus.MEMBER))
-    event = MagicMock()
-    event.chat.id, event.chat.type = -100999, "supergroup"
-    event.new_chat_member.status = ChatMemberStatus.MEMBER
-    await adapter.on_bot_added(event)
+    await adapter.on_bot_added(joined_event(-100999))
     text = env.bot.send_message.await_args.args[1]
     assert "сделайте меня админом" in text and "«Удалять сообщения»" in text and "я не админ" not in text
 

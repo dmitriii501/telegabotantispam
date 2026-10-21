@@ -4,6 +4,7 @@ import html
 import io
 import os
 import random
+import re
 import sqlite3
 from typing import Any, cast
 
@@ -63,6 +64,25 @@ PROFILE_TIMEOUT = 4.0  # seconds a newcomer's first message may wait for the pro
 TRIAL_NOTICES_PER_DAY = 5
 TRIAL_ADMIN_TESTS_PER_DAY = 20
 AUTO_REMEMBER_CONFIDENCE = 0.95  # bans this sure are remembered, so copies of the spam skip Jev
+
+# A buyer's question ("how much", "how to sign up", "is there delivery") goes to the owner at once.
+LEAD_ALERT = 0.6
+LEAD_ALERTS_PER_DAY = 40  # per chat; the rest waits for the digest, so a busy chat cannot flood the owner
+
+# Growth: where people come from, follow-ups after /start, the bot's signature, the invitation reward.
+SOURCE_PATTERN = re.compile(r"[^a-z0-9_\-]")
+DIRECT_SOURCE = "direct"
+NUDGE_AFTER = (3600, 24 * 3600)  # seconds after /start: the first and the second follow-up, and no more
+NUDGE_HOURS_MSK = (9, 22)  # follow-ups are only sent in the daytime
+SIGNATURE_START = "sig"
+REFERRAL_DAYS = 30  # given to both after the invited one pays for the first time
+PILOT_REPORT_DAYS = (3, 7, 13)  # days of the trial on which the owner gets a report
+CONNECT_RIGHTS = "delete_messages+restrict_members"
+
+# Other moderation bots: their usernames (lowercase, part of the name) and how to call them.
+COMPANION_BOTS = {
+    "combot": "Combot", "chatkeeper": "ChatKeeper", "shieldy": "Shieldy", "missrose": "Rose", "rosebot": "Rose",
+}
 
 # Antiflood defaults; every chat can change them. The limits keep the settings sane.
 FLOOD_MESSAGES = 6
@@ -192,6 +212,9 @@ HELP_TEXT = (
     "/privacy — какие данные хранит бот, /offer — оферта\n"
     "/night on|off|0 7 — ночью (часы по Москве) проверка строже, а новичкам нельзя ссылки\n"
     "/antiraid on|off — предупреждать о массовых заходах; /cleanservice on|off — убирать «вошёл» и «вышел»\n"
+    "/leads on|off — вопросы покупателей («сколько стоит», «как записаться») сразу в личку, а не только в сводке\n"
+    "/signature on|off — подпись «DefenceAi» под сообщениями бота в чате (отключается на платных тарифах)\n"
+    "/coexist on|off — если в чате есть Combot, Rose и другие, не дублировать капчу и приветствие\n"
     "/ocr on|off — смотреть картинки и стикеры новичков (реклама в виде картинки)\n"
     "/captcha on|off — новичок после первого сообщения нажимает нужную кнопку, иначе сообщение удаляется и мут на сутки\n"
     "/profilecheck on|off — проверять профиль новичков; /profile ответом на сообщение покажет, что бот видит\n"
@@ -305,6 +328,22 @@ def user_of(message: Message) -> User:
     if message.from_user is None:
         raise ValueError("the message has no sender")
     return message.from_user
+
+
+def find_companions(members) -> str:
+    """Names of the other moderation bots among the chat's administrators ("Combot, Rose"), alphabetically."""
+    names: set[str] = set()
+    for member in members:
+        user = member.user
+        username = (user.username or "").lower()
+        if user.is_bot:
+            names.update(title for part, title in COMPANION_BOTS.items() if part in username)
+    return ", ".join(sorted(names))
+
+
+def signature_markup(bot_username: str | None) -> str:
+    """The small line under the bot's messages in a group; the link brings people to the bot."""
+    return f'\n\n<a href="https://t.me/{bot_username or "DefenceAiBot"}?start={SIGNATURE_START}">🛡 DefenceAi</a>'
 
 
 def callback_data(call: CallbackQuery) -> str:

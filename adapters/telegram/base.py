@@ -24,6 +24,7 @@ from adapters.telegram.common import (
     ADMIN_CACHE_TTL,
     MAX_RETRY_WAIT,
     NOT_ADMIN,
+    find_companions,
     media_label,
     user_of,
 )
@@ -48,6 +49,7 @@ class AdapterBase:
         self.moderator = moderator
         self.storage = storage
         self._admins: dict[int, tuple[float, set[int]]] = {}
+        self._companions: dict[int, str] = {}  # other moderation bots seen per chat
         self._titles: dict[int, str] = {}
         self._threads: dict[tuple[int, int], deque] = {}
         self._checked: dict[tuple[int, int], float] = {}
@@ -61,6 +63,7 @@ class AdapterBase:
         self._raid_alerted: dict[int, float] = {}
         self._captcha: dict[tuple[int, int], dict] = {}  # open checks: (chat, user) -> answer, messages
         self._purged_day = ""
+        self._pilot_tried: dict[int, str] = {}  # chat -> the day a trial report was last attempted
         self.heartbeat = time.time()  # refreshed by the daily-job loop every minute; /health reads it
         self.webapp_url = os.getenv("WEBAPP_URL", "").rstrip("/")
 
@@ -75,7 +78,19 @@ class AdapterBase:
             cached = (time.time(), {m.user.id for m in members})
             self._admins[chat_id] = cached
             await self.storage.remember_admins(chat_id, cached[1])
+            await self._note_companions(chat_id, find_companions(members))
         return user_id in cached[1]
+
+    async def _note_companions(self, chat_id: int, names: str) -> None:
+        """Other moderation bots are admins too: the list of admins is where they show up."""
+        if self._companions.get(chat_id) != names:
+            self._companions[chat_id] = names
+            await self.storage.set_companions(chat_id, names)
+
+    async def detect_companions(self, chat_id: int) -> str:
+        """Look at the chat's admins now and return the names of the other moderation bots ("Combot, Rose")."""
+        await self.is_admin(chat_id, 0, fresh=True)
+        return self._companions.get(chat_id, "")
 
     async def is_admin_message(self, message: Message) -> bool:
         # Anonymous admins post on behalf of the group itself.

@@ -27,6 +27,7 @@ from aiogram.types import (
 
 from adapters.telegram.base import AdapterBase
 from adapters.telegram.common import (
+    REFERRAL_DAYS,
     callback_data,
     user_of,
 )
@@ -338,6 +339,7 @@ class PaymentsMixin(AdapterBase):
             return None
         PAYMENTS.inc(currency=currency)
         PAYMENT_AMOUNT.inc(amount, currency=currency)
+        gift = await self.referral_reward(charge_id, payer_id, chat_id)
         self._usage.pop(chat_id, None)
         chat = await self.storage.get_chat(chat_id)
         acc = await self.access_for(chat)
@@ -348,7 +350,7 @@ class PaymentsMixin(AdapterBase):
         log.info("payment chat=%s plan=%s months=%s amount=%s %s", chat_id, plan_key, months, amount, currency)
         return (
             f"✅ Спасибо! Тариф «{PLANS[plan_key].title}» для чата «{title}» оплачен до {date_text(acc.until)}.\n"
-            "Правила и настройки на месте, ИИ-проверка работает. Вопросы по оплате: /paysupport"
+            "Правила и настройки на месте, ИИ-проверка работает. Вопросы по оплате: /paysupport" + gift
         )
 
     async def on_paid(self, message: Message) -> None:
@@ -498,6 +500,41 @@ class PaymentsMixin(AdapterBase):
             await self.storage.set_order(order["order_id"], status.lower(), payment_id)
         return True
 
+    # ------------------------------------------------------------ invitations
+
+    async def referral_reward(self, charge_id: str, payer_id: int, chat_id: int) -> str:
+        """The first payment of an invited person: +days to their chat and to the inviter's. Returns a line for the
+        thank-you text, or "" when this payment earns nothing."""
+        invite = await self.storage.referral_of(payer_id)
+        if not invite or invite["rewarded_at"] or await self.storage.payments_of(payer_id) != 1:
+            return ""
+        referrer = invite["referrer_id"]
+        chats = await self.storage.chats_of_user(referrer)
+        referrer_chat = chats[0]["chat_id"] if chats else None
+        if not await self.storage.reward_referral(payer_id, charge_id, chat_id, referrer_chat, REFERRAL_DAYS):
+            return ""
+        await self.storage.add_bonus_days(chat_id, REFERRAL_DAYS)
+        gift = f"+{days_text(REFERRAL_DAYS)}"
+        if referrer_chat:
+            await self.storage.add_bonus_days(referrer_chat, REFERRAL_DAYS)
+            self._usage.pop(referrer_chat, None)
+            await self.dm(referrer, f"🎁 Приглашённый вами человек оплатил первый месяц: {gift} к вашему чату «{html.escape(await self.chat_title(referrer_chat))}».")
+        else:
+            await self.dm(referrer, f"🎁 Приглашённый вами человек оплатил первый месяц. {gift} появятся, как только вы подключите бота к чату.")
+        log.info("referral reward: inviter=%s invitee=%s chat=%s", referrer, payer_id, chat_id)
+        return f"\n🎁 {gift} в подарок за то, что вас пригласили."
+
+    async def referral_take_back(self, charge_id: str) -> None:
+        """The payment that earned the gift was refunded: the days go back."""
+        invite = await self.storage.referral_by_charge(charge_id)
+        if not invite or not invite["days"]:
+            return
+        for chat in (invite["invitee_chat"], invite["referrer_chat"]):
+            if chat:
+                await self.storage.add_bonus_days(chat, -invite["days"])
+                self._usage.pop(chat, None)
+        await self.storage.take_back_referral(invite["invitee_id"])
+
     # ---------------------------------------------------------- the operator's tools
 
     def is_operator(self, message: Message) -> bool:
@@ -548,6 +585,7 @@ class PaymentsMixin(AdapterBase):
             await message.answer(f"Не получилось вернуть деньги: {html.escape(str(e))}")
             return
         await self.storage.mark_refunded(charge_id)
+        await self.referral_take_back(charge_id)
         self._usage.pop(payment["chat_id"], None)
         await message.answer(f"Возвращено {given}, срок уменьшен на {payment['months']} мес.")
 
@@ -580,7 +618,7 @@ class PaymentsMixin(AdapterBase):
                 key = None
                 if acc.state == "expired":
                     key = "expired"
-                elif acc.days_left in REMIND_DAYS:
+                elif acc.days_left in REMIND_DAYS and not (acc.state == "trial" and acc.days_left == 1):
                     key = f"{acc.state}:{acc.days_left}"
                 if not key or key == chat["billing_notice"]:
                     continue

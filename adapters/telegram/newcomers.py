@@ -36,7 +36,7 @@ from adapters.telegram.common import (
     on_off,
     user_of,
 )
-from adapters.telegram.payments import PaymentsMixin
+from adapters.telegram.growth import GrowthMixin
 from core.avatar import dhash
 from core.models import ActionType, Profile
 from core.moderation import (
@@ -47,7 +47,7 @@ from core.storage import DAY
 log = logging.getLogger(__name__)
 
 
-class NewcomerMixin(PaymentsMixin):
+class NewcomerMixin(GrowthMixin):
     """Newcomers: the profile check, the "I am human" button, joins and raids."""
 
     async def _load_profile(self, user_id: int):
@@ -105,6 +105,9 @@ class NewcomerMixin(PaymentsMixin):
         chat_id = message.chat.id
         if previous_messages > 0 or (chat_id, user_id) in self._captcha or await self.storage.is_verified(chat_id, user_id):
             return
+        chat = await self.storage.get_chat(chat_id)
+        if ChatConfig.from_row(chat).yields_to_others:
+            return  # another bot already asks newcomers to prove they are human: one check is enough
         options = SECURE_RANDOM.sample(range(len(CAPTCHA_PICTURES)), 4)  # not guessable from earlier checks
         answer = SECURE_RANDOM.choice(options)
         user = user_of(message)
@@ -113,8 +116,11 @@ class NewcomerMixin(PaymentsMixin):
         try:
             notice = await self.bot.send_message(
                 chat_id,
-                f"{mention}, подтвердите, что вы человек: нажмите на {CAPTCHA_PICTURES[answer][1]}. "
-                f"Иначе ваше первое сообщение будет удалено.",
+                await self.signed(
+                    f"{mention}, подтвердите, что вы человек: нажмите на {CAPTCHA_PICTURES[answer][1]}. "
+                    f"Иначе ваше первое сообщение будет удалено.",
+                    chat,
+                ),
                 reply_to_message_id=message.message_id,
                 reply_markup=markup,
             )

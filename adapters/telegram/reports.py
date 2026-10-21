@@ -22,10 +22,13 @@ from adapters.telegram.common import (
     RETENTION_DAYS,
     chat_message_link,
 )
+from adapters.telegram.payments import days_text, number
 from adapters.telegram.review import ReviewMixin
+from core.billing import access, pilot_report_due, trial_started
 from core.jev_client import JevError
 from core.metrics import METRICS
 from core.models import DELETING_ACTIONS, ActionType, Author, Comment
+from core.moderation import ChatConfig
 from core.storage import DAY
 
 log = logging.getLogger(__name__)
@@ -90,6 +93,62 @@ class ReportsMixin(ReviewMixin):
             f"Полезных: {s.get(ActionType.FORWARD_USEFUL.value, 0)}\n"
             f"Расход ИИ: около ${s['tokens'] / 1e6 * JEV_PRICE_PER_MTOK:.2f}"
         )
+
+    # ------------------------------------------------------------ trial reports
+    async def build_pilot_report(self, chat, key: str, started: int, now: int) -> str:
+        """What the bot did for the owner since the trial began: spam, bans, buyers' questions, reversed decisions."""
+        chat_id = chat["chat_id"]
+        config = ChatConfig.from_row(chat)
+        n = await self.storage.pilot_numbers(chat_id, started)
+        title = html.escape(await self.chat_title(chat_id))
+        days = max(1, (now - started) // DAY)
+        head = "Итоги пробного периода" if key == "final" else f"Итоги {days_text(days)}"
+        lines = [f"📊 <b>{head}</b>, чат «{title}»"]
+        if not n["checked"]:
+            lines.append(
+                "Комментариев пока не было, или у меня нет доступа к ним. Проверьте, что я админ в группе обсуждений "
+                "с правами удалять сообщения и банить: /settings."
+            )
+            return "\n".join(lines)
+        removed_word, banned_word = ("удалил бы", "забанил бы") if config.observe else ("удалено", "забанено")
+        lines.append(f"Проверено комментариев: {number(n['checked'])}")
+        lines.append(f"🧹 Спама и рекламы {removed_word}: {n['removed']}" + (f", ботов {banned_word}: {n['banned']}" if n["banned"] else ""))
+        if config.analytics:
+            lines.append(f"🛒 Вопросов покупателей найдено: {n['leads']}")
+            for row in await self.storage.lead_examples(chat_id, started, 3):
+                snippet = row["text"] if len(row["text"]) <= 140 else row["text"][:140] + "…"
+                lines.append(f"• {html.escape(row['user_name'] or '')}: «{html.escape(snippet)}»\n{chat_message_link(chat_id, row['message_id'])}")
+        lines.append(f"↩️ Решений, которые вы отменили: {n['overturned']}")
+        if config.yields_to_others and n["removed"]:
+            verb = "поймал бы" if config.observe else "поймал"
+            lines.append(f"🤝 Рядом работает {html.escape(config.companions)}. Спама, который он пропустил, а я {verb}: {n['removed']}")
+        if config.observe:
+            lines.append("\nСейчас пробный режим: ничего не удалялось. Чтобы включить настоящую модерацию, напишите в чате /observe off.")
+        if key == "final":
+            acc = access(chat, await self.storage.ai_checks(chat_id, started))
+            lines.append(f"\n⏰ {self.access_text(acc)}")
+        return "\n".join(lines)
+
+    async def send_pilot_reports(self, now: int | None = None) -> None:
+        """Once a day: the trial reports (day 3, 7, 13 and the last day) to the owners of chats on the trial."""
+        now = now or int(time.time())
+        today = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+        for chat in await self.storage.all_chats():
+            chat_id, owner_id = chat["chat_id"], chat["owner_id"]
+            if not owner_id or not chat["enabled"] or self._pilot_tried.get(chat_id) == today:
+                continue
+            try:
+                acc = await self.access_for(chat)
+                started = trial_started(chat)
+                key = pilot_report_due(started, acc.until, now, chat["pilot_report"]) if acc.state == "trial" else None
+                if not key:
+                    continue
+                self._pilot_tried[chat_id] = today  # a person who has not started the bot is not retried every minute
+                text = await self.build_pilot_report(chat, key, started, now)
+                if await self.dm(owner_id, text, self.pay_markup(chat_id) if key == "final" else None):
+                    await self.storage.set_pilot_report(chat_id, key)
+            except Exception:  # one broken chat must not stop the others
+                log.exception("Pilot report failed for chat %s", chat_id)
 
     # ------------------------------------------------------------------- digest
     async def build_digest(
@@ -189,10 +248,15 @@ class ReportsMixin(ReviewMixin):
             await asyncio.sleep(60)
             self.heartbeat = time.time()
             self._log_metrics()
+            try:
+                await self.send_nudges()
+            except Exception:
+                log.exception("Follow-ups failed")
             now = datetime.now(timezone.utc)
             if now.hour == DIGEST_HOUR_UTC:
                 try:
                     await self.send_digests(now)
+                    await self.send_pilot_reports()
                     await self.send_billing_notices()
                     await self.purge_expired(now.strftime("%Y-%m-%d"))
                 except Exception:

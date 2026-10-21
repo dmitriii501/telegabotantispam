@@ -147,6 +147,28 @@ CREATE TABLE IF NOT EXISTS reports (
     ts INTEGER NOT NULL,
     PRIMARY KEY (chat_id, message_id, reporter_id)
 );
+-- People who pressed /start in the bot: where they came from (the first label wins) and how far the nudges went.
+CREATE TABLE IF NOT EXISTS starts (
+    user_id INTEGER PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    username TEXT,
+    nudges INTEGER NOT NULL DEFAULT 0,  -- follow-up messages sent so far (at most two)
+    nudged_at INTEGER NOT NULL DEFAULT 0
+);
+-- Who invited whom, and the reward once the invited one paid for the first time.
+CREATE TABLE IF NOT EXISTS referrals (
+    invitee_id INTEGER PRIMARY KEY,
+    referrer_id INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
+    rewarded_at INTEGER,
+    charge_id TEXT,
+    invitee_chat INTEGER,
+    referrer_chat INTEGER,
+    days INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals (referrer_id);
 CREATE TABLE IF NOT EXISTS trusted (
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -189,6 +211,13 @@ CHAT_COLUMNS = [
     ("paid_until", "INTEGER"),
     ("trial_until", "INTEGER"),
     ("billing_notice", "TEXT NOT NULL DEFAULT ''"),
+    ("created_at", "INTEGER"),
+    ("added_by", "INTEGER"),  # who added the bot to the chat
+    ("signature", "INTEGER NOT NULL DEFAULT 1"),  # "🛡 DefenceAi" under the bot's messages in the group (switchable on paid plans)
+    ("leads_instant", "INTEGER NOT NULL DEFAULT 1"),  # tell the owner about a buyer's question at once
+    ("coexist", "INTEGER NOT NULL DEFAULT 1"),  # do not repeat captcha and greetings when another moderation bot is here
+    ("companions", "TEXT NOT NULL DEFAULT ''"),  # other moderation bots seen among the chat's admins
+    ("pilot_report", "TEXT NOT NULL DEFAULT ''"),  # the last report of the trial that was sent
 ]
 LOG_COLUMNS = [
     ("executed", "INTEGER NOT NULL DEFAULT 1"),
@@ -202,7 +231,7 @@ LOG_COLUMNS = [
 SETTINGS = (
     {name for name, _ in CHAT_COLUMNS}
     - {"rules_json", "pending_json", "digest_last", "allowed_domains", "blocked_domains", "lockdown_until"}
-    - {"plan", "paid_until", "trial_until", "billing_notice"}
+    - {"plan", "paid_until", "trial_until", "billing_notice", "created_at", "added_by", "companions", "pilot_report"}
     | {"enabled"}
 )
 
@@ -210,8 +239,14 @@ COPIED_SETTINGS = (
     "mode", "escalation", "digest", "useful_mode", "conflicts", "antiflood", "analytics", "flood_messages",
     "flood_window", "flood_mute", "links_mode", "allowed_domains", "blocked_domains", "profile_check", "captcha",
     "clean_service", "antiraid", "first_strict", "image_ocr", "night_mode", "night_from", "night_to",
+    "signature", "leads_instant", "coexist",
 )
 DAY = 24 * 3600
+HOUR = 3600
+MAX_NUDGES = 2  # follow-ups after /start without connecting a chat
+LEAD_MIN = 0.6  # at this score a comment counts as a buyer's question
+# SQL: this person has a chat (owns it, or added the bot to it)
+_CONNECTED = "EXISTS (SELECT 1 FROM chats c WHERE c.added_by = starts.user_id OR c.owner_id = starts.user_id)"
 DELETION_WINDOW_DAYS = 30
 DELETING = ("delete_and_ban", "delete_and_mute", "delete_silent", "delete_and_explain")
 
@@ -284,8 +319,8 @@ class Storage:
     async def ensure_chat(self, chat_id: int) -> bool:
         """Create the chat row if missing; True when it was just created."""
         cur = await self.db.execute(
-            "INSERT OR IGNORE INTO chats (chat_id, trial_until) VALUES (?, ?)",
-            (chat_id, int(time.time()) + TRIAL_DAYS * DAY),
+            "INSERT OR IGNORE INTO chats (chat_id, trial_until, created_at) VALUES (?, ?, ?)",
+            (chat_id, int(time.time()) + TRIAL_DAYS * DAY, int(time.time())),
         )
         await self.db.commit()
         return cur.rowcount == 1
@@ -718,6 +753,167 @@ class Storage:
         )
         await self.db.commit()
         return until
+
+    # --- growth: where people come from, follow-ups, invitations ---
+
+    async def record_start(self, user_id: int, name: str, username: str | None, source: str) -> bool:
+        """Remember a person's first /start with its label. True when this is the first one."""
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO starts (user_id, ts, source, name, username) VALUES (?,?,?,?,?)",
+            (user_id, int(time.time()), source, name, username),
+        )
+        await self.db.commit()
+        return cur.rowcount == 1
+
+    async def get_start(self, user_id: int) -> aiosqlite.Row | None:
+        async with self.db.execute("SELECT * FROM starts WHERE user_id = ?", (user_id,)) as cur:
+            return await cur.fetchone()
+
+    async def set_added_by(self, chat_id: int, user_id: int) -> None:
+        await self.db.execute("UPDATE chats SET added_by = COALESCE(added_by, ?) WHERE chat_id = ?", (user_id, chat_id))
+        await self.db.commit()
+
+    async def set_companions(self, chat_id: int, names: str) -> None:
+        await self.db.execute("UPDATE chats SET companions = ? WHERE chat_id = ?", (names, chat_id))
+        await self.db.commit()
+
+    async def set_pilot_report(self, chat_id: int, key: str) -> None:
+        await self.db.execute("UPDATE chats SET pilot_report = ? WHERE chat_id = ?", (key, chat_id))
+        await self.db.commit()
+
+    async def sources(self, since: int = 0) -> list[tuple[str, int, int]]:
+        """(label, people who pressed /start, of them connected the bot to a chat), most popular first."""
+        async with self.db.execute(
+            f"""SELECT source, COUNT(*) AS starts, SUM({_CONNECTED}) AS connected FROM starts
+                WHERE ts >= ? GROUP BY source ORDER BY starts DESC, source""",
+            (since,),
+        ) as cur:
+            return [(row["source"], row["starts"], row["connected"] or 0) for row in await cur.fetchall()]
+
+    async def due_nudges(self, now: int) -> list[aiosqlite.Row]:
+        """People who pressed /start, have no chat yet and were not nudged twice: the caller decides who is due."""
+        async with self.db.execute(
+            f"SELECT * FROM starts WHERE nudges < ? AND ts <= ? AND NOT {_CONNECTED}", (MAX_NUDGES, now - HOUR)
+        ) as cur:
+            return list(await cur.fetchall())
+
+    async def close_nudges_of_connected(self) -> None:
+        await self.db.execute(f"UPDATE starts SET nudges = ? WHERE nudges < ? AND {_CONNECTED}", (MAX_NUDGES, MAX_NUDGES))
+        await self.db.commit()
+
+    async def set_nudges(self, user_id: int, count: int) -> None:
+        await self.db.execute("UPDATE starts SET nudges = ?, nudged_at = ? WHERE user_id = ?", (count, int(time.time()), user_id))
+        await self.db.commit()
+
+    async def add_referral(self, invitee_id: int, referrer_id: int) -> bool:
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO referrals (invitee_id, referrer_id, ts) VALUES (?,?,?)", (invitee_id, referrer_id, int(time.time()))
+        )
+        await self.db.commit()
+        return cur.rowcount == 1
+
+    async def referral_of(self, invitee_id: int) -> aiosqlite.Row | None:
+        async with self.db.execute("SELECT * FROM referrals WHERE invitee_id = ?", (invitee_id,)) as cur:
+            return await cur.fetchone()
+
+    async def referral_by_charge(self, charge_id: str) -> aiosqlite.Row | None:
+        async with self.db.execute("SELECT * FROM referrals WHERE charge_id = ?", (charge_id,)) as cur:
+            return await cur.fetchone()
+
+    async def reward_referral(self, invitee_id: int, charge_id: str, invitee_chat: int, referrer_chat: int | None, days: int) -> bool:
+        """Mark the invitation as paid out. False when it already was (a second payment gives nothing)."""
+        cur = await self.db.execute(
+            """UPDATE referrals SET rewarded_at = ?, charge_id = ?, invitee_chat = ?, referrer_chat = ?, days = ?
+               WHERE invitee_id = ? AND rewarded_at IS NULL""",
+            (int(time.time()), charge_id, invitee_chat, referrer_chat, days, invitee_id),
+        )
+        await self.db.commit()
+        return cur.rowcount == 1
+
+    async def claim_referral_bonus(self, referrer_id: int, chat_id: int) -> int:
+        """A person who earned days before they had a chat gets them on their first chat. Returns the days."""
+        async with self.db.execute(
+            "SELECT COALESCE(SUM(days), 0) FROM referrals WHERE referrer_id = ? AND rewarded_at IS NOT NULL AND referrer_chat IS NULL",
+            (referrer_id,),
+        ) as cur:
+            days = await _first(cur)
+        if days:
+            await self.db.execute(
+                "UPDATE referrals SET referrer_chat = ? WHERE referrer_id = ? AND rewarded_at IS NOT NULL AND referrer_chat IS NULL",
+                (chat_id, referrer_id),
+            )
+            await self.db.commit()
+        return days
+
+    async def take_back_referral(self, invitee_id: int) -> None:
+        await self.db.execute("UPDATE referrals SET days = 0 WHERE invitee_id = ?", (invitee_id,))
+        await self.db.commit()
+
+    async def referral_stats(self, referrer_id: int | None = None) -> dict[str, int]:
+        """Invited, paid, and days given in total (all people, or one referrer's)."""
+        where, args = ("WHERE referrer_id = ?", (referrer_id,)) if referrer_id is not None else ("", ())
+        async with self.db.execute(
+            f"SELECT COUNT(*) AS invited, COUNT(rewarded_at) AS paid, COALESCE(SUM(days), 0) AS days FROM referrals {where}", args
+        ) as cur:
+            row = await cur.fetchone()
+        return {"invited": row["invited"], "paid": row["paid"], "days": row["days"]} if row else {"invited": 0, "paid": 0, "days": 0}
+
+    async def add_bonus_days(self, chat_id: int, days: int) -> int | None:
+        """Extra days of access as a gift: onto the paid term, else onto the trial; an ended chat gets that many paid days.
+        Negative days take a gift back. Returns the new end, None when the chat is unknown."""
+        chat = await self.get_chat(chat_id)
+        if chat is None:
+            return None
+        now, delta = int(time.time()), days * DAY
+        paid, trial = chat["paid_until"] or 0, chat["trial_until"] or 0
+        if paid > now:
+            column, until = "paid_until", paid + delta
+        elif trial > now:
+            column, until = "trial_until", trial + delta
+        else:
+            column, until = "paid_until", max(now + delta, 0)
+        extra = ", plan = 'start'" if column == "paid_until" and not chat["plan"] else ""
+        await self.db.execute(f"UPDATE chats SET {column} = ?, billing_notice = ''{extra} WHERE chat_id = ?", (until, chat_id))
+        await self.db.commit()
+        return until
+
+    async def payments_of(self, payer_id: int) -> int:
+        """Payments of this person that were not refunded."""
+        async with self.db.execute("SELECT COUNT(*) FROM payments WHERE payer_id = ? AND refunded = 0", (payer_id,)) as cur:
+            return await _first(cur)
+
+    async def chats_of_user(self, user_id: int) -> list[aiosqlite.Row]:
+        """Chats the person owns or added the bot to, the newest first."""
+        async with self.db.execute(
+            "SELECT * FROM chats WHERE owner_id = ? OR added_by = ? ORDER BY COALESCE(created_at, 0) DESC, chat_id", (user_id, user_id)
+        ) as cur:
+            return list(await cur.fetchall())
+
+    # --- the pilot report ---
+
+    async def pilot_numbers(self, chat_id: int, since: int) -> dict[str, int]:
+        """What the bot did since `since`: checked, removed (also those only logged in the trial mode), banned,
+        buyers' questions found, decisions the admin reversed."""
+        marks = ", ".join("?" for _ in DELETING)
+        async with self.db.execute(
+            f"""SELECT COUNT(*) AS checked,
+                       COALESCE(SUM(action IN ({marks})), 0) AS removed,
+                       COALESCE(SUM(action = 'delete_and_ban'), 0) AS banned,
+                       COALESCE(SUM(category IN ('normal', 'useful') AND lead >= ?), 0) AS leads,
+                       COALESCE(SUM(feedback = 'not_spam'), 0) AS overturned
+                FROM log WHERE chat_id = ? AND ts >= ?""",
+            (*DELETING, LEAD_MIN, chat_id, since),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else {"checked": 0, "removed": 0, "banned": 0, "leads": 0, "overturned": 0}
+
+    async def lead_examples(self, chat_id: int, since: int, limit: int = 3) -> list[aiosqlite.Row]:
+        async with self.db.execute(
+            """SELECT * FROM log WHERE chat_id = ? AND ts >= ? AND category IN ('normal', 'useful') AND lead >= ?
+               ORDER BY lead DESC, id DESC LIMIT ?""",
+            (chat_id, since, LEAD_MIN, limit),
+        ) as cur:
+            return list(await cur.fetchall())
 
     async def get_payment(self, charge_id: str) -> aiosqlite.Row | None:
         async with self.db.execute("SELECT * FROM payments WHERE charge_id = ?", (charge_id,)) as cur:

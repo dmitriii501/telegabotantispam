@@ -16,11 +16,11 @@ async function saveSetting(key, value) {
 }
 
 // One row of the settings list: a colored icon, a title with a hint, a switch.
-function toggle(key, ico, color, title, hint, danger) {
+function toggle(key, ico, color, title, hint, danger, locked) {
   const on = state.data.settings[key];
   return `<div class="set ${danger ? "dangerous" : ""}"><div class="ico">${icon(ico)}</div>
     <div class="lbl">${title}<small>${hint}</small></div>
-    <label class="sw"><input type="checkbox" data-set="${key}" ${on ? "checked" : ""} aria-label="${title}"><i></i></label></div>`;
+    <label class="sw"><input type="checkbox" data-set="${key}" ${on ? "checked" : ""} ${locked ? "disabled" : ""} aria-label="${title}"><i></i></label></div>`;
 }
 
 const INT_LIMITS = { night_from: [0, 23], night_to: [0, 23] };
@@ -139,9 +139,9 @@ async function untrust(userId) {
 
 const SETTING_KEYS = {
   spam: ["antiflood", "escalation", "first_strict", "image_ocr", "night_mode"],
-  newbies: ["profile_check", "captcha"],
+  newbies: ["profile_check", "captcha", "coexist"],
   raids: ["antiraid", "clean_service", "lockdown"],
-  notify: ["analytics", "conflicts", "digest"],
+  notify: ["analytics", "leads_instant", "conflicts", "digest", "signature"],
 };
 const LINK_LABEL = { ai: "решает ИИ", block: "только из списка", newcomers: "не новичкам" };
 const countOn = (keys) => `${keys.filter((k) => state.data.settings[k]).length} из ${keys.length} включено`;
@@ -183,7 +183,8 @@ const FOLDERS = {
     summary: () => countOn(SETTING_KEYS.newbies),
     body: () => `<div class="group">
       ${toggle("profile_check", "user", null, "Проверка профиля", "Имя, ник, описание и аватарка: ловит аккаунты-приманки")}
-      ${toggle("captcha", "robot", null, "Проверка «я человек»", "После первого сообщения новичок нажимает нужную кнопку за 2 минуты, иначе мут на сутки")}</div>`,
+      ${toggle("captcha", "robot", null, "Проверка «я человек»", "После первого сообщения новичок нажимает нужную кнопку за 2 минуты, иначе мут на сутки")}
+      ${toggle("coexist", "users", null, "Не мешать другим ботам", state.data.settings.companions ? `В чате есть: ${esc(state.data.settings.companions)}. Капчу и приветствие не дублирую, ловлю то, что он пропустил` : "Если рядом работают Combot, Rose и подобные, капчу и приветствие не дублирую")}</div>`,
   },
   raids: {
     icon: "users",
@@ -212,8 +213,10 @@ const FOLDERS = {
     summary: () => countOn(SETTING_KEYS.notify),
     body: () => `<div class="group">
       ${toggle("analytics", "pie", null, "Аналитика комментариев", "Тип, тон и «ждёт ответа» для каждого комментария")}
+      ${toggle("leads_instant", "cart", null, "Вопросы покупателей сразу", "«Сколько стоит», «как записаться», «есть ли доставка» приходят вам в личку сразу, а не в сводке")}
       ${toggle("conflicts", "flame", null, "Предупреждать о ссорах", "Сообщу вам, если обсуждение накаляется")}
       ${toggle("digest", "news", null, "Ежедневная сводка", "Каждый день в 09:00 по Москве")}
+      ${toggle("signature", "shield", null, "Подпись «DefenceAi»", state.data.billing.state === "paid" ? "Маленькая ссылка под сообщениями бота в чате" : "Под сообщениями бота в чате. Отключается на платном тарифе", false, state.data.billing.state !== "paid")}
       <div class="block"><div class="title">Полезные комментарии присылать</div>
         ${segmented("useful_mode", [["digest", "В сводку"], ["instant", "Сразу"], ["off", "Не нужно"]])}</div></div>`,
   },

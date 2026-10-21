@@ -10,7 +10,7 @@ import logging
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllChatAdministrators,
@@ -43,6 +43,7 @@ class TelegramAdapter(PipelineMixin):
     def __init__(self, bot: Bot, moderator: Moderator, storage: Storage, ocr: OcrEngine | None = None):
         super().__init__(bot, moderator, storage, ocr)
         self._init_payments()
+        self._init_growth()
         self.router = Router()
         self._register()
 
@@ -56,6 +57,7 @@ class TelegramAdapter(PipelineMixin):
         r = self.router
         r.message(CommandStart(), F.chat.type == ChatType.PRIVATE)(self.on_start)
         self._register_payments(r)
+        self._register_growth(r)
         r.message(Command("privacy"))(self.on_privacy)
         r.message(Command("offer"))(self.on_offer)
         r.my_chat_member()(self.on_bot_added)
@@ -76,6 +78,9 @@ class TelegramAdapter(PipelineMixin):
         r.message(Command("night"), GROUPS)(self.on_night)
         r.message(Command("spam"), GROUPS, F.reply_to_message)(self.on_spam_report)
         r.message(Command("ocr"), GROUPS)(self.on_ocr)
+        r.message(Command("signature"), GROUPS)(self.on_signature)
+        r.message(Command("leads"), GROUPS)(self.on_leads)
+        r.message(Command("coexist"), GROUPS)(self.on_coexist)
         r.message(Command("firststrict"), GROUPS)(self.on_firststrict)
         r.message(Command("antiraid"), GROUPS)(self.on_antiraid)
         r.message(Command("profilecheck"), GROUPS)(self.on_profilecheck)
@@ -98,12 +103,6 @@ class TelegramAdapter(PipelineMixin):
         r.message(GROUPS)(self.on_group_message)
         r.edited_message(GROUPS)(self.on_edited_message)
 
-    async def on_start(self, message: Message, command: CommandObject | None = None) -> None:
-        arg = (command.args or "") if command else ""
-        if arg.startswith("pay_") and await self.start_payment(message, arg[4:]):
-            return
-        await message.answer(HELP_TEXT, reply_markup=self.panel_markup())
-
     async def on_privacy(self, message: Message) -> None:
         site = self.webapp_url
         await message.answer(PRIVACY_TEXT + (f"\n\nПолный текст: {site}/privacy" if site else ""))
@@ -120,6 +119,7 @@ class TelegramAdapter(PipelineMixin):
     async def set_commands(self) -> None:
         """The "/" menu in Telegram: short lists, so people find the commands without reading the manual."""
         private = [BotCommand(command="start", description="Как подключить бота"),
+                   BotCommand(command="ref", description="Пригласить коллегу, +30 дней обоим"),
                    BotCommand(command="panel", description="Панель управления")]
         admins = [
             BotCommand(command="panel", description="Панель: правила, настройки, журнал"),
@@ -158,6 +158,15 @@ class TelegramAdapter(PipelineMixin):
         created = await self.storage.ensure_chat(event.chat.id)
         if created:
             await self.storage.set_setting(event.chat.id, "observe", 1)
+        adder = event.from_user
+        if adder and not adder.is_bot:
+            await self.storage.set_added_by(event.chat.id, adder.id)
+        if created:
+            await self.announce_chat(event)
+            await self.claim_referral(adder.id if adder else None, event.chat.id)
+        companions = await self.detect_companions(event.chat.id)
+        if companions:
+            await self.coexist_note(adder, event.chat.id, companions)
         missing = await self.check_rights(event.chat.id)
         if missing == [NOT_ADMIN]:
             text = "Привет! " + RIGHTS_TEXT
@@ -178,5 +187,7 @@ class TelegramAdapter(PipelineMixin):
                 "Готов к работе. Задайте правила обычным языком: "
                 "<code>/rules мат можно, рекламу нельзя — бан</code>"
             )
+        if companions and (await self.config(event.chat.id)).coexist:
+            return  # the other bot has greeted the chat already: the hello would only be a copy
         with contextlib.suppress(TelegramAPIError):
-            await self.bot.send_message(event.chat.id, text)
+            await self.bot.send_message(event.chat.id, await self.signed(text, await self.storage.get_chat(event.chat.id)))

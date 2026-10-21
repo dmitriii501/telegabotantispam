@@ -31,6 +31,8 @@ from adapters.telegram.common import (
     FLOOD_WINDOW,
     IMAGE_TIMEOUT,
     JEV_ALERT_COOLDOWN,
+    LEAD_ALERT,
+    LEAD_ALERTS_PER_DAY,
     OCR_TIMEOUT,
     PROFILE_TIMEOUT,
     RIGHTS_ALERT_COOLDOWN,
@@ -362,6 +364,7 @@ class PipelineMixin(SettingsMixin):
             await self._challenge_if_due(who, prepared, config, decision, observe_blocks=True)
             return
         log_id = await self._write_log(who, decision, verdict)
+        await self._buyer_alert(who, config, decision, verdict, log_id)
         log.info("chat=%s author=%s action=%s edited=%s %s", chat_id, who.author_id, decision.action.value, who.edited, verdict)
         if config.observe:
             await self.storage.set_executed(log_id, False)  # a dry run: recorded, not carried out
@@ -402,6 +405,32 @@ class PipelineMixin(SettingsMixin):
             await self.storage.add_usage(message.chat.id)
         self.note_usage(message.chat.id, verdict.input_tokens)
         return log_id
+
+    async def _buyer_alert(self, who: "Incoming", config: ChatConfig, decision: Decision, verdict: Verdict, log_id: int) -> None:
+        """A buyer's question ("how much", "how to sign up", "is there delivery") must not wait for the digest:
+        the owner gets it at once, also in the trial mode. A busy chat sends a limited number a day."""
+        chat = who.chat
+        owner_id = chat["owner_id"] if chat else None
+        if (
+            not owner_id
+            or not config.leads_instant
+            or verdict.lead < LEAD_ALERT
+            or who.edited
+            or who.is_channel
+            or decision.action in DELETING_ACTIONS
+            or decision.action == ActionType.SEND_TO_REVIEW
+        ):
+            return
+        message = who.message
+        if self.trial_slot(message.chat.id, "lead", LEAD_ALERTS_PER_DAY) is None:
+            return
+        title = html.escape(await self.chat_title(message.chat.id))
+        await self.dm(
+            owner_id,
+            f"🛒 <b>Вопрос покупателя</b>, чат «{title}», {html.escape(who.author_name)}:\n"
+            f"{quote(who.text or self.shown_text(message, decision))}\n"
+            f"{chat_message_link(message.chat.id, message.message_id, message.chat.username)}",
+        )
 
     async def _challenge_if_due(
         self, who: "Incoming", prepared: "Prepared", config: ChatConfig, decision: Decision, observe_blocks: bool = False
@@ -559,7 +588,7 @@ class PipelineMixin(SettingsMixin):
                 tail = f" Писать в чате можно будет через {human_duration(hours)}." if hours else ""
                 notice = await self.bot.send_message(
                     message.chat.id,
-                    f"{mention}, ваш комментарий удалён: {html.escape(decision.reason)}.{tail}",
+                    await self.signed(f"{mention}, ваш комментарий удалён: {html.escape(decision.reason)}.{tail}", chat),
                     reply_to_message_id=message.reply_to_message.message_id if message.reply_to_message else None,
                     reply_markup=kb([("Не согласен — оспорить", f"appeal:{log_id}")]),
                 )

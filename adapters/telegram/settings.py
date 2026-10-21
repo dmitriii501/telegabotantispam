@@ -114,6 +114,9 @@ class SettingsMixin(ReportsMixin):
             f"Строгая проверка первых комментариев под постом: {on_off(config.first_strict)}\n"
             f"Ночной режим: {describe_night(config)}\n"
             f"Проверка «я человек» для новичков: {on_off(config.captcha)}\n"
+            f"Вопросы покупателей сразу в личку: {on_off(config.leads_instant)}\n"
+            f"Подпись «DefenceAi» под сообщениями бота: {on_off(config.signature)}\n"
+            f"Рядом другие боты: {config.companions + (', я им не мешаю' if config.yields_to_others else '') if config.companions else 'не вижу'}\n"
             f"Проверка картинок и стикеров новичков: {on_off(config.image_ocr and self.sees_images)}\n"
             f"Пробный режим (ничего не удаляю): {on_off(config.observe)}\n\n"
             f"<b>Правила</b>\n{describe_rules(config.rules)}\n❌ спам и мошенничество — всегда запрещены"
@@ -138,6 +141,21 @@ class SettingsMixin(ReportsMixin):
             return
         await self.storage.set_setting(message.chat.id, key, int(arg == "on"))
         await message.reply(f"{title}: {on_off(arg == 'on')}")
+
+    async def on_signature(self, message: Message, command: CommandObject) -> None:
+        """/signature on|off: the small "🛡 DefenceAi" line under the bot's messages in the group. Paid plans only."""
+        chat = await self.storage.get_chat(message.chat.id)
+        if chat and (command.args or "").strip().lower() == "off" and (await self.access_for(chat)).state != "paid":
+            if await self.is_admin_message(message):
+                await message.reply("Подпись можно отключить на платном тарифе: /plan")
+            return
+        await self._switch(message, command, "signature", "Подпись «DefenceAi» под сообщениями бота")
+
+    async def on_leads(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "leads_instant", "Вопросы покупателей сразу в личку")
+
+    async def on_coexist(self, message: Message, command: CommandObject) -> None:
+        await self._switch(message, command, "coexist", "Уступать другому боту капчу и приветствия")
 
     async def on_lockdown(self, message: Message, command: CommandObject) -> None:
         arg = await self.admin_args(message, command)

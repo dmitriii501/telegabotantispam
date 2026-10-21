@@ -121,6 +121,14 @@ class ChatConfig:
     night_mode: bool = False  # at night: strict thresholds, and newcomers may not post links
     night_from: int = 0  # Moscow hours, the night lasts from `night_from` up to `night_to`
     night_to: int = 7
+    signature: bool = True  # "🛡 DefenceAi" under the bot's own messages in the group
+    leads_instant: bool = True  # tell the owner about a buyer's question at once, not only in the digest
+    coexist: bool = True  # do not repeat captcha and greetings when another moderation bot works here
+    companions: str = ""  # names of the other moderation bots seen in the chat, comma separated
+
+    @property
+    def yields_to_others(self) -> bool:
+        return self.coexist and bool(self.companions)
 
     def night_active(self, now: datetime | None = None) -> bool:
         if not self.night_mode:
@@ -175,6 +183,10 @@ class ChatConfig:
             night_mode=_column(row, "night_mode", 0) == 1,
             night_from=int(_column(row, "night_from", 0)),
             night_to=int(_column(row, "night_to", 7)),
+            signature=_column(row, "signature", 1) == 1,
+            leads_instant=_column(row, "leads_instant", 1) == 1,
+            coexist=_column(row, "coexist", 1) == 1,
+            companions=str(_column(row, "companions", "")),
         )
 
 
@@ -303,7 +315,7 @@ ANALYTICS_QUESTIONS = {
     },
     "lead": {
         "type": "noul",
-        "instructions": "Автор `comment` хочет купить, узнать цену или условия, записаться или просит связаться с ним?",
+        "instructions": "Автор `comment` хочет купить или заказать, спрашивает цену, наличие, доставку или условия, хочет записаться или просит связаться с ним?",
     },
     "needs_answer": {
         "type": "noul",

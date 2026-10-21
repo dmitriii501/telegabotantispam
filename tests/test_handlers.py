@@ -74,10 +74,13 @@ async def env(tmp_path):
         setattr(bot, name, AsyncMock())
     bot.send_message.return_value = MagicMock(message_id=555)
     bot.get_chat = AsyncMock(return_value=MagicMock(linked_chat_id=LINKED, title="Чат"))
+    bot.get_chat_member_count = AsyncMock(return_value=120)
+    bot.get_chat_administrators = AsyncMock(return_value=[])
 
     def build(*responses):
         jev = ScriptedJev(*responses)
         adapter = TelegramAdapter(bot, Moderator(jev), storage)
+        adapter.bot_username = "DefenceAiBot"
         adapter.is_admin = AsyncMock(side_effect=lambda chat_id, user_id, fresh=False: user_id == ADMIN_ID)
         return adapter, jev
 
@@ -90,6 +93,15 @@ async def env(tmp_path):
 async def last_log(storage):
     async with storage.db.execute("SELECT * FROM log ORDER BY id DESC LIMIT 1") as cur:
         return await cur.fetchone()
+
+
+def joined_event(chat_id, adder_id=OWNER, title="Новый чат"):
+    """Telegram's "the bot was added to a chat" update."""
+    e = MagicMock()
+    e.chat.id, e.chat.type, e.chat.title = chat_id, "supergroup", title
+    e.new_chat_member.status = ChatMemberStatus.MEMBER
+    e.from_user = MagicMock(id=adder_id, full_name="Админ Канала", first_name="Админ", username="chan_admin", is_bot=False)
+    return e
 
 
 def sent_to(bot, chat_id):
@@ -233,14 +245,9 @@ async def test_new_chats_start_in_observe_mode_existing_ones_do_not(env):
     adapter, _ = env.build()
     env.bot.get_chat_member = AsyncMock(return_value=MagicMock(status=ChatMemberStatus.ADMINISTRATOR, can_delete_messages=True, can_restrict_members=True))
     env.bot.id = 1
-    def joined(chat_id):
-        e = MagicMock()
-        e.chat.id, e.chat.type = chat_id, "supergroup"
-        e.new_chat_member.status = ChatMemberStatus.MEMBER
-        return e
-    await adapter.on_bot_added(joined(-100999))
+    await adapter.on_bot_added(joined_event(-100999))
     assert (await env.storage.get_chat(-100999))["observe"] == 1
-    await adapter.on_bot_added(joined(CHAT))
+    await adapter.on_bot_added(joined_event(CHAT))
     assert (await env.storage.get_chat(CHAT))["observe"] == 0
 
 

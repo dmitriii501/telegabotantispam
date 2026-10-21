@@ -120,3 +120,27 @@ def extend(row, plan_key: str, months: int, now: float | None = None) -> int:
     same = (_col(row, "plan") or "start") == plan_key
     base = current if current > now and same else now
     return base + months * PERIOD_DAYS * DAY
+
+
+PILOT_DAYS = (3, 7, 13)  # days of the trial on which the owner gets a report; one more comes on the last day
+PILOT_KEYS = (*(f"d{d}" for d in PILOT_DAYS), "final")
+
+
+def trial_started(row) -> int:
+    """When the chat's trial began: the day the bot came, or (for old rows) counted back from the end."""
+    created = _col(row, "created_at")
+    if created:
+        return int(created)
+    return int((_col(row, "trial_until") or time.time()) - TRIAL_DAYS * DAY)
+
+
+def pilot_report_due(started: int, until: int, now: int, last: str = "") -> str | None:
+    """The trial report to send now: "d3", "d7", "d13" or "final" (the last day, with the payment button).
+    Only the latest one that is due and not sent yet; the ones skipped by a long outage are not made up."""
+    if now >= until:
+        return None
+    day = (now - started) // DAY + 1
+    due = ["final"] if until - now <= DAY else [f"d{d}" for d in PILOT_DAYS if day >= d]
+    key = due[-1] if due else None
+    already = PILOT_KEYS.index(last) if last in PILOT_KEYS else -1
+    return key if key and PILOT_KEYS.index(key) > already else None

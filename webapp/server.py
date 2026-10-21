@@ -43,6 +43,7 @@ INT_LABELS = {"flood_messages": "Сообщений подряд", "flood_window
 BOOL_SETTINGS = (
     "lockdown", "escalation", "digest", "enabled", "conflicts", "antiflood", "analytics", "observe",
     "profile_check", "captcha", "clean_service", "antiraid", "first_strict", "image_ocr", "night_mode",
+    "signature", "leads_instant", "coexist",
 )
 DELETING = {a.value for a in DELETING_ACTIONS}
 
@@ -162,6 +163,10 @@ def chat_payload(chat, trusted) -> dict:
             "night_from": config.night_from,
             "night_to": config.night_to,
             "image_ocr": config.image_ocr,
+            "signature": config.signature,
+            "leads_instant": config.leads_instant,
+            "coexist": config.coexist,
+            "companions": config.companions,
             "digest": bool(chat["digest"]),
             "useful_mode": chat["useful_mode"],
             "enabled": bool(chat["enabled"]),
@@ -357,7 +362,10 @@ async def put_settings(request: web.Request) -> web.Response:
             updates[key] = value
         else:
             raise ApiError(400, f"Некорректная настройка: {key}")
-    storage = request.app["adapter"].storage
+    adapter = request.app["adapter"]
+    storage = adapter.storage
+    if updates.get("signature") == 0 and (await adapter.access_for(chat)).state != "paid":
+        raise ApiError(403, "Подпись можно отключить на платном тарифе")
     for key, value in updates.items():
         if key == "lockdown":
             await storage.set_lockdown(chat["chat_id"], bool(value))  # a manual switch has no end time
